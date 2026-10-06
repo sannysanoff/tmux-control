@@ -1,10 +1,12 @@
 package main
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -13,6 +15,31 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// gzipWriter wraps a ResponseWriter so a handler's writes are compressed.
+type gzipWriter struct {
+	http.ResponseWriter
+	w *gzip.Writer
+}
+
+func (g gzipWriter) Write(b []byte) (int, error) { return g.w.Write(b) }
+
+// gzipIfAccepted compresses a response when the caller asks for it. Nothing below
+// this layer compresses: the relay carries ciphertext and its transport never
+// negotiates encoding, so a history page is only ever squeezed here.
+func gzipIfAccepted(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		if !strings.Contains(req.Header.Get("Accept-Encoding"), "gzip") {
+			next(w, req)
+			return
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Add("Vary", "Accept-Encoding")
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+		next(gzipWriter{ResponseWriter: w, w: gz}, req)
+	}
 }
 
 func writeErr(w http.ResponseWriter, code int, msg string) {
@@ -26,6 +53,7 @@ func (r *Registry) Routes() http.Handler {
 	m.HandleFunc("GET /sessions/{id}", r.handleGetSession)
 	m.HandleFunc("GET /sessions/{id}/pane", r.handlePane)
 	m.HandleFunc("GET /sessions/{id}/messages", r.handleMessages)
+	m.HandleFunc("GET /sessions/{id}/events", gzipIfAccepted(r.handleEvents))
 	m.HandleFunc("POST /sessions/{id}/break", r.handleBreak)
 	m.HandleFunc("POST /sessions/{id}/send", r.handleSend)
 	m.HandleFunc("POST /sessions/{id}/paste", r.handlePaste)
@@ -80,23 +108,33 @@ func (r *Registry) handleListSessions(w http.ResponseWriter, req *http.Request) 
 	}
 	r.mu.RUnlock()
 
-	// enrich with session rows + last messages (small id set)
-	idset := map[string]bool{}
+	// enrich with session rows + last messages, from the database that holds them:
+	// every profile keeps its own state.db, so ids are grouped by database.
+	byDB := map[string][]string{}
 	for _, ps := range panes {
-		if ps.SessionID != "" {
-			idset[ps.SessionID] = true
+		if ps.SessionID == "" {
+			continue
+		}
+		db := r.dbFor(ps.Profile)
+		byDB[db] = append(byDB[db], ps.SessionID)
+	}
+	sessions := map[string]SessionRow{}
+	msgs := map[string]LastExchange{}
+	for db, ids := range byDB {
+		s, err := LoadSessions(db, ids)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		for k, v := range s {
+			sessions[k] = v
+		}
+		if m, err := LoadLastMessages(db, ids); err == nil {
+			for k, v := range m {
+				msgs[k] = v
+			}
 		}
 	}
-	ids := make([]string, 0, len(idset))
-	for id := range idset {
-		ids = append(ids, id)
-	}
-	sessions, err := LoadSessions(r.dbPath, ids)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	msgs, _ := LoadLastMessages(r.dbPath, ids)
 	r.mu.RLock()
 	for i := range panes {
 		ps := &panes[i]
@@ -136,12 +174,13 @@ func (r *Registry) handleGetSession(w http.ResponseWriter, req *http.Request) {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
-	if s, err2 := LoadSessions(r.dbPath, []string{sid}); err2 == nil {
+	db := r.dbFor(ps.Profile)
+	if s, err2 := LoadSessions(db, []string{sid}); err2 == nil {
 		if srow, ok := s[sid]; ok {
 			ps.Session = &srow
 		}
 	}
-	if le, err2 := LoadLastMessages(r.dbPath, []string{sid}); err2 == nil {
+	if le, err2 := LoadLastMessages(db, []string{sid}); err2 == nil {
 		if x, ok := le[sid]; ok {
 			ps.LastQuery = x.LastQuery
 			ps.LastAnswer = x.LastAnswer
@@ -175,7 +214,8 @@ func (r *Registry) handlePane(w http.ResponseWriter, req *http.Request) {
 // user+assistant behaviour.
 func (r *Registry) handleMessages(w http.ResponseWriter, req *http.Request) {
 	sid := req.PathValue("id")
-	if _, _, err := r.findPaneBySession(sid); err != nil {
+	_, ps, err := r.findPaneBySession(sid)
+	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
@@ -196,12 +236,79 @@ func (r *Registry) handleMessages(w http.ResponseWriter, req *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid role: must be user, assistant or all")
 		return
 	}
-	msgs, err := LoadMessages(r.dbPath, sid, role, limit)
+	msgs, err := LoadMessages(r.dbFor(ps.Profile), sid, role, limit)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"session_id": sid, "count": len(msgs), "messages": msgs})
+}
+
+// handleEvents serves GET /sessions/{id}/events?since_id=N&limit=M&max_chars=C:
+// the whole session, every role, in id order — the incremental feed the console
+// archives locally. since_id is the last id the caller stored (0 = from the
+// start); a full page means there is more, so the caller pages until it is short.
+func (r *Registry) handleEvents(w http.ResponseWriter, req *http.Request) {
+	sid := req.PathValue("id")
+	_, ps, err := r.findPaneBySession(sid)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	q := req.URL.Query()
+
+	var sinceID int64
+	if q.Has("since_id") {
+		n, err := strconv.ParseInt(q.Get("since_id"), 10, 64)
+		if err != nil || n < 0 {
+			writeErr(w, http.StatusBadRequest, "invalid since_id: must be a non-negative integer")
+			return
+		}
+		sinceID = n
+	}
+
+	limit := 500
+	if q.Has("limit") {
+		n, err := strconv.Atoi(q.Get("limit"))
+		if err != nil || n <= 0 {
+			writeErr(w, http.StatusBadRequest, "invalid limit: must be a positive integer")
+			return
+		}
+		if n > 2000 {
+			n = 2000
+		}
+		limit = n
+	}
+
+	maxChars := 2000
+	if q.Has("max_chars") {
+		n, err := strconv.Atoi(q.Get("max_chars"))
+		if err != nil || n <= 0 {
+			writeErr(w, http.StatusBadRequest, "invalid max_chars: must be a positive integer")
+			return
+		}
+		if n > 200000 {
+			n = 200000
+		}
+		maxChars = n
+	}
+
+	events, err := LoadEvents(r.dbFor(ps.Profile), sid, sinceID, limit, maxChars)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	last := sinceID
+	if len(events) > 0 {
+		last = events[len(events)-1].ID
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session_id": sid,
+		"count":      len(events),
+		"last_id":    last,
+		"has_more":   len(events) == limit,
+		"events":     events,
+	})
 }
 
 func (r *Registry) handleBreak(w http.ResponseWriter, req *http.Request) {

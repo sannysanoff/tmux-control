@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // SessionRow mirrors a row of the hermes sessions table (read-only).
@@ -29,6 +30,80 @@ type MsgRow struct {
 type LastExchange struct {
 	LastQuery  *MsgRow `json:"last_query,omitempty"`
 	LastAnswer *MsgRow `json:"last_answer,omitempty"`
+}
+
+// EventRow is one message of ANY role, unlike MsgRow: the console keeps a local
+// archive of the whole session, so tool rows and the tool calls on assistant
+// rows are the point, not noise. Long fields are clipped before they go on the
+// wire — a tool's output is not worth its bytes to an archive that only needs to
+// know which files were touched.
+type EventRow struct {
+	ID        int64  `json:"id"`
+	Role      string `json:"role"`
+	Content   string `json:"content,omitempty"`
+	ToolName  string `json:"tool_name,omitempty"`
+	ToolCalls string `json:"tool_calls,omitempty"`
+	TS        string `json:"ts"`
+}
+
+// hardContentCap bounds a text row even when no clipping is asked for: a
+// pathological answer must not turn one event page into a hundred megabytes.
+const hardContentCap = 200_000
+
+// clip truncates s to at most n bytes on a rune boundary, marking the cut. n <= 0
+// means "no clipping at all".
+func clip(s string, n int) string {
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
+// LoadEvents returns message rows for one session in id order (oldest first),
+// starting after sinceID. It is the incremental feed the console archives: the
+// caller stores the last id it received and asks for everything newer next time,
+// so a session is pulled once and only its new rows ever travel again.
+//
+// sinceID 0 means the whole history from the beginning, paged by limit. maxChars
+// clips a tool row's output and every row's tool_calls; user and assistant text
+// is kept whole up to hardContentCap. Returns rows ascending; the caller detects
+// "there is more" simply by getting a full page.
+func LoadEvents(dbPath, sid string, sinceID int64, limit, maxChars int) ([]EventRow, error) {
+	out := []EventRow{}
+	lit := idLiteral(sid)
+	if lit == "" {
+		return out, nil
+	}
+	q := `SELECT id AS id, role AS role, coalesce(content,'') AS content,
+	  coalesce(tool_name,'') AS tool_name, coalesce(tool_calls,'') AS tool_calls,
+	  strftime('%Y-%m-%dT%H:%M:%SZ', timestamp, 'unixepoch') AS ts
+	  FROM messages WHERE session_id = ` + lit + ` AND id > ` + strconv.FormatInt(sinceID, 10) + `
+	  ORDER BY id ASC LIMIT ` + strconv.Itoa(limit)
+	rows, err := sqliteJSON(dbPath, q, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		e := EventRow{
+			ID:        int64(asFloat(r["id"])),
+			Role:      asString(r["role"]),
+			ToolName:  asString(r["tool_name"]),
+			ToolCalls: clip(asString(r["tool_calls"]), maxChars),
+			TS:        asString(r["ts"]),
+		}
+		switch e.Role {
+		case "tool", "system":
+			e.Content = clip(asString(r["content"]), maxChars)
+		default:
+			e.Content = clip(asString(r["content"]), hardContentCap)
+		}
+		out = append(out, e)
+	}
+	return out, nil
 }
 
 // sqliteJSON runs a read-only query via the sqlite3 CLI and returns JSON rows.
@@ -65,6 +140,18 @@ func asString(v any) string {
 }
 
 func asBool(v any) bool { return asString(v) == "1" }
+
+// asFloat reads a number that sqlite3 -json may hand back as a JSON number.
+func asFloat(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case string:
+		f, _ := strconv.ParseFloat(n, 64)
+		return f
+	}
+	return 0
+}
 
 func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", n), ",")

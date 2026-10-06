@@ -31,6 +31,7 @@ func scanHermesProcs() []hermesProc {
 			continue
 		}
 		hp := hermesProc{pid: pid, cmdline: strings.TrimSpace(cmdline)}
+		hp.profile = profileFor(pid, hp.cmdline)
 		if st, err := os.ReadFile("/proc/" + de.Name() + "/stat"); err == nil {
 			f := strings.Fields(string(st))
 			if len(f) > 2 && f[2] == "T" {
@@ -78,4 +79,18 @@ func procAlive(pid int, start float64) bool {
 		return false
 	}
 	return true
+}
+
+// procEnvHermesHome reads HERMES_HOME out of a process's environment.
+func procEnvHermesHome(pid int) string {
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/environ")
+	if err != nil {
+		return ""
+	}
+	for _, kv := range strings.Split(string(b), "\x00") {
+		if strings.HasPrefix(kv, "HERMES_HOME=") {
+			return strings.TrimPrefix(kv, "HERMES_HOME=")
+		}
+	}
+	return ""
 }

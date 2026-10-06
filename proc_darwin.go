@@ -45,6 +45,7 @@ func scanHermesProcs() []hermesProc {
 			tty:       "/dev/" + f[0],
 			suspended: strings.Contains(f[2], "T"),
 			cmdline:   cmdline,
+			profile:   profileFor(pid, cmdline),
 		})
 	}
 	return procs
@@ -76,4 +77,25 @@ func procAlive(pid int, start float64) bool {
 	}
 	err := syscall.Kill(pid, 0)
 	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// procEnvHermesHome reads HERMES_HOME out of a process's environment. There is no
+// /proc to read, so it comes from ps -E, which appends the environment to the
+// command line ("… ENV=val ENV2=val2"). A value is taken up to the next space,
+// which is how every path this looks for is shaped.
+func procEnvHermesHome(pid int) string {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-E", "-ww", "-o", "command=").Output()
+	if err != nil {
+		return ""
+	}
+	const key = "HERMES_HOME="
+	i := strings.Index(string(out), key)
+	if i < 0 {
+		return ""
+	}
+	rest := string(out)[i+len(key):]
+	if j := strings.IndexAny(rest, " \n	"); j >= 0 {
+		rest = rest[:j]
+	}
+	return strings.TrimSpace(rest)
 }

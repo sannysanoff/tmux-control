@@ -126,3 +126,54 @@ func digitsOnly(s string) bool {
 	}
 	return true
 }
+
+// profileFor names the hermes profile a process runs under: the flag it was
+// started with if the command line carries one, otherwise the profile that its
+// HERMES_HOME points into. Empty means the default profile. The flag is preferred
+// because it survives process listings that hide the environment, and because
+// the shape there is a Python argv literal — ['hermes', '-p', 'rtassist'] — the
+// command line is tokenised on quotes and commas rather than searched for " -p ".
+func profileFor(pid int, cmdline string) string {
+	if p := profileFromCmdline(cmdline); p != "" {
+		return p
+	}
+	return profileFromHermesHome(procEnvHermesHome(pid))
+}
+
+func profileFromCmdline(cmdline string) string {
+	toks := strings.FieldsFunc(cmdline, func(r rune) bool {
+		switch r {
+		case ' ', '	', '\n', '\'', '"', ',', '[', ']':
+			return true
+		}
+		return false
+	})
+	for i, t := range toks {
+		if t != "-p" && t != "--profile" {
+			continue
+		}
+		if i+1 >= len(toks) {
+			return ""
+		}
+		if name := strings.TrimSpace(toks[i+1]); name != "" && !strings.HasPrefix(name, "-") {
+			return name
+		}
+	}
+	return ""
+}
+
+// profileFromHermesHome reads the profile out of a HERMES_HOME value of the shape
+// <home>/.hermes/profiles/<name>. Empty when it points at the default home.
+func profileFromHermesHome(home string) string {
+	home = strings.TrimSpace(home)
+	if home == "" {
+		return ""
+	}
+	parts := strings.Split(filepath.Clean(home), string(filepath.Separator))
+	for i := 0; i+1 < len(parts); i++ {
+		if parts[i] == "profiles" {
+			return parts[i+1]
+		}
+	}
+	return ""
+}

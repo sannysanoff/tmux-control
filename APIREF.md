@@ -31,9 +31,10 @@ All tmux panes with their hermes associations. Fields:
 | `has_hermes` | any hermes process attached to the pane tty |
 | `running` | at least one hermes process in foreground (not SIGTSTP'd) |
 | `status` | `running` / `suspended-only` / `no-hermes` / `dead-pane` |
-| `associations` | hermes processes on the tty: `pid`, `running`, `suspended`, `session_id` (from hermes lease file), `source` (`lease` when the lease entry matched this pid), `cmdline` |
+| `associations` | hermes processes on the tty: `pid`, `running`, `suspended`, `session_id` (from hermes lease file), `profile` (the profile the process runs under, from its `-p`/`--profile` flag or its `HERMES_HOME`; absent for the default profile), `source` (`lease` when the lease entry matched this pid, `proc` when the process scan found it without a lease), `cmdline` |
 | `session_id` | current session of the pane: per-tty marker file (tracks `/new`, `/resume`), falling back to the lease |
 | `session` | row from `state.db`: `id`, `title`, `profile`, `cwd`, `ended`, `ended_at` |
+| `profile` | the hermes profile the pane's process runs under (absent for the default profile); leases, markers, logs and the session row all come from that profile's own home, `<hermes-home>/profiles/<name>/` |
 | `last_query` | latest human message: `role`, `content`, `ts` (ISO, from `state.db`) |
 | `last_answer` | latest assistant message (same shape) |
 | `turn` | last observed turn from `agent.log`: `state` (`running`/`answered`/`interrupted`), `since` (log timestamp), `detail` (turn-start query hint or turn-end reason, e.g. `interrupted_by_user`) |
@@ -121,6 +122,39 @@ client reverses for its newest-first rail):
 are returned (tool/system rows skipped). A session with no messages is 200
 with `count: 0` and `"messages": []`. 404 if the id is not associated with
 any pane (same error text as `GET /sessions/{id}`).
+
+### GET /sessions/{id}/events
+
+The whole session, every role, in `id` order (oldest first) — the incremental
+feed a client archives locally. Unlike `/messages`, tool rows and the tool calls
+on assistant rows are included: the caller wants to know what was run and which
+files were touched, not just what was said.
+
+Query parameters (all optional):
+
+| parameter | default | meaning |
+|---|---|---|
+| `since_id` | `0` | return rows with `id` greater than this. `0` starts at the beginning; otherwise pass the `last_id` of the previous page |
+| `limit` | `500` | rows per page, clamped to 2000 |
+| `max_chars` | `2000` | clip a tool row's output and every row's `tool_calls` to this many bytes (clamped to 200000). User/assistant text is never clipped below a 200000-byte safety cap |
+
+```json
+{"session_id":"20261006_200628_6e4365","count":3,"last_id":40350,"has_more":true,
+ "events":[
+  {"id":40348,"role":"user","content":"please add …","ts":"2026-10-06T18:08:52Z"},
+  {"id":40349,"role":"assistant","tool_calls":"[{\"id\":…","ts":"2026-10-06T18:08:55Z"},
+  {"id":40350,"role":"tool","tool_name":"skill_view","content":"{\"success\": true…","ts":"2026-10-06T18:08:55Z"}]}
+```
+
+`has_more` is true when a full page came back, so a client pages until it is
+short. Store `last_id` and ask for `since_id=<last_id>` next time: a session is
+pulled once and only its new rows travel afterwards. Each row carries `id`,
+`role`, `ts`, and then whichever of `content`, `tool_name`, `tool_calls` apply.
+Clipping appends `…` so a truncated field is never mistaken for the whole text.
+
+The response is gzip-compressed when the request carries
+`Accept-Encoding: gzip`; nothing lower in the stack compresses (the relay carries
+ciphertext), so this is the only place a large page is squeezed.
 
 ### POST /sessions/{id}/break
 

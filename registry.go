@@ -39,6 +39,7 @@ type PaneAssoc struct {
 	Running    bool   `json:"running"`
 	Suspended  bool   `json:"suspended"`
 	SessionID  string `json:"session_id,omitempty"`
+	Profile    string `json:"profile,omitempty"`
 	Source     string `json:"source"`
 	LeaseStale bool   `json:"lease_stale,omitempty"`
 	Cmdline    string `json:"cmdline,omitempty"`
@@ -53,6 +54,7 @@ type PaneStatus struct {
 	Running       bool        `json:"running"`
 	Status        string      `json:"status"`
 	SessionID     string      `json:"session_id,omitempty"`
+	Profile       string      `json:"profile,omitempty"`
 	Session       *SessionRow `json:"session,omitempty"`
 	LastQuery     *MsgRow     `json:"last_query,omitempty"`
 	LastAnswer    *MsgRow     `json:"last_answer,omitempty"`
@@ -66,18 +68,22 @@ var hermesProcRe = regexp.MustCompile(`\.hermes/hermes-agent/`)
 
 // Registry holds mutable state and scans the system periodically.
 type Registry struct {
-	mu           sync.RWMutex
-	hermesHome   string
-	dbPath       string
-	turnWindow   time.Duration
-	enterDelay   time.Duration
-	captureMax   int
-	logOffsets   map[string]int64 // inode -> read offset for agent.log tracking
-	logInode     uint64
-	lastAgentMod time.Time
-	turnState    map[string]TurnState // session id -> last turn state
-	panes        map[PaneID]PaneStatus
-	updated      time.Time
+	mu         sync.RWMutex
+	hermesHome string
+	dbPath     string
+	turnWindow time.Duration
+	enterDelay time.Duration
+	captureMax int
+	logs       map[string]*logTail  // agent.log path -> tail state, one per profile
+	turnState  map[string]TurnState // session id -> last turn state
+	panes      map[PaneID]PaneStatus
+	updated    time.Time
+}
+
+// logTail remembers how far one profile's agent.log has been read.
+type logTail struct {
+	mod    time.Time
+	offset int64
 }
 
 // TurnState is the outcome of the last observed turn for a session.
@@ -95,7 +101,7 @@ func NewRegistry(hermesHome string, dbPath string, turnWindow time.Duration, cap
 		dbPath:     dbPath,
 		turnWindow: turnWindow,
 		captureMax: captureMax,
-		logOffsets: map[string]int64{},
+		logs:       map[string]*logTail{},
 		turnState:  map[string]TurnState{},
 		panes:      map[PaneID]PaneStatus{},
 	}
@@ -117,37 +123,62 @@ func (r *Registry) Run(ctx context.Context, every time.Duration) {
 	}
 }
 
-// refreshLogState tails agent.log and updates per-session turn state.
+// refreshLogState tails every profile's agent.log and updates per-session turn
+// state. One log per profile: a pane running profile rtassist has its turns in
+// profiles/rtassist/logs/agent.log, not in the default home's log.
 func (r *Registry) refreshLogState() {
-	path := filepath.Join(r.hermesHome, "logs", "agent.log")
-	info, err := os.Stat(path)
-	if err != nil {
-		return
-	}
-	if info.ModTime().Before(r.lastAgentMod) && !r.lastAgentMod.IsZero() {
-		return
-	}
-	r.lastAgentMod = info.ModTime()
-	lines, total, err := tailLines(path, 4000)
-	if err != nil {
-		return
-	}
-	for _, line := range lines {
-		ev := parseTurnLine(line)
-		if ev.Kind == TurnNone || ev.SessionID == "" {
+	for _, path := range r.logPaths() {
+		info, err := os.Stat(path)
+		if err != nil {
 			continue
 		}
-		if ev.Kind == TurnStarted {
-			r.turnState[ev.SessionID] = TurnState{State: "running", Since: parseLogTS(ev.TS), Detail: ev.QueryHint}
-		} else {
-			st := "answered"
-			if strings.Contains(ev.Reason, "interrupt") {
-				st = "interrupted"
-			}
-			r.turnState[ev.SessionID] = TurnState{State: st, Since: parseLogTS(ev.TS), Detail: ev.Reason}
+		st := r.logs[path]
+		if st == nil {
+			st = &logTail{}
+			r.logs[path] = st
 		}
+		if !st.mod.IsZero() && !info.ModTime().After(st.mod) {
+			continue
+		}
+		st.mod = info.ModTime()
+		lines, total, err := tailLines(path, 4000)
+		if err != nil {
+			continue
+		}
+		for _, line := range lines {
+			ev := parseTurnLine(line)
+			if ev.Kind == TurnNone || ev.SessionID == "" {
+				continue
+			}
+			if ev.Kind == TurnStarted {
+				r.turnState[ev.SessionID] = TurnState{State: "running", Since: parseLogTS(ev.TS), Detail: ev.QueryHint}
+			} else {
+				st := "answered"
+				if strings.Contains(ev.Reason, "interrupt") {
+					st = "interrupted"
+				}
+				r.turnState[ev.SessionID] = TurnState{State: st, Since: parseLogTS(ev.TS), Detail: ev.Reason}
+			}
+		}
+		st.offset = total
 	}
-	r.logOffsets["agent.log"] = total
+}
+
+// logPaths is the default profile's log plus one per profile seen in the panes.
+func (r *Registry) logPaths() []string {
+	out := []string{filepath.Join(r.hermesHome, "logs", "agent.log")}
+	seen := map[string]bool{}
+	r.mu.RLock()
+	for _, ps := range r.panes {
+		p := ps.Profile
+		if p == "" || p == "default" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, filepath.Join(r.hermesHome, "profiles", p, "logs", "agent.log"))
+	}
+	r.mu.RUnlock()
+	return out
 }
 
 // parseLogTS parses "2026-10-05 12:56:09,473" into UTC time.
@@ -167,21 +198,50 @@ func (r *Registry) scanOnce() {
 		return
 	}
 	procs := scanHermesProcs()
-	leases, err := LoadLeases(r.hermesHome)
-	if err != nil {
-		log.Printf("scan: leases: %v", err)
+
+	// Leases and markers live in each profile's own home, and nowhere else: the
+	// default home's files say nothing about a pane running profile rtassist.
+	profiles := map[string]bool{"": true}
+	for _, pr := range procs {
+		profiles[pr.profile] = true
 	}
-	markers, err := LoadMarkers(r.hermesHome)
-	if err != nil {
-		log.Printf("scan: markers: %v", err)
+	leases := map[int]LeaseEntry{}
+	markers := map[string]MarkerEntry{} // "<profile>|<tty>" -> marker
+	for p := range profiles {
+		home := r.profileHome(p)
+		if lf, err := LoadLeases(home); err != nil {
+			log.Printf("scan: leases %s: %v", home, err)
+		} else {
+			for pid, le := range lf {
+				leases[pid] = le
+			}
+		}
+		if mm, err := LoadMarkers(home); err != nil {
+			log.Printf("scan: markers %s: %v", home, err)
+		} else {
+			for tty, m := range mm {
+				markers[p+"|"+tty] = m
+			}
+		}
 	}
 
 	// tty -> hermes processes
 	ttyProcs := map[string][]PaneAssoc{}
 	for _, pr := range procs {
-		a := PaneAssoc{PID: pr.pid, Running: !pr.suspended, Suspended: pr.suspended, Cmdline: pr.cmdline}
+		a := PaneAssoc{
+			PID:       pr.pid,
+			Running:   !pr.suspended,
+			Suspended: pr.suspended,
+			Profile:   pr.profile,
+			Cmdline:   pr.cmdline,
+		}
 		if le, ok := leases[pr.pid]; ok && procAlive(pr.pid, le.ProcessStartTime) {
+			// live_session_id is the session being served right now; it can be
+			// empty, in which case the lease's own session id is the answer.
 			a.SessionID = le.LiveSessionID
+			if a.SessionID == "" {
+				a.SessionID = le.SessionID
+			}
 			a.Source = SourceLease.String()
 		} else {
 			// found by the process scan alone: no lease names its session
@@ -195,6 +255,7 @@ func (r *Registry) scanOnce() {
 		ps := PaneStatus{Pane: p}
 		assocs := ttyProcs[p.TTY]
 		ps.Assocs = assocs
+		ps.Profile = ps.profileOf()
 		for _, a := range assocs {
 			if a.Running {
 				ps.HasHermes = true
@@ -216,7 +277,7 @@ func (r *Registry) scanOnce() {
 		// session id: prefer per-tty marker (current), else lease, else none
 		if ps.HasHermes {
 			sid := ""
-			if m, ok := markers[p.TTY]; ok {
+			if m, ok := markers[ps.Profile+"|"+p.TTY]; ok {
 				sid = m.SessionID
 			}
 			if sid == "" {
@@ -252,10 +313,44 @@ func (ps *PaneStatus) runningAssoc() *PaneAssoc {
 }
 
 // hermesProc is one detected hermes process, as found by the platform-specific
-// scan (proc_linux.go reads /proc, proc_darwin.go shells out to ps).
+// scan (proc_linux.go reads /proc, proc_darwin.go shells out to ps). profile is
+// the hermes profile it runs under, empty for the default one.
 type hermesProc struct {
 	pid       int
 	tty       string
 	suspended bool
 	cmdline   string
+	profile   string
+}
+
+// profileHome is the hermes home a profile keeps its state in: the registry's own
+// home for the default profile, <home>/profiles/<name> otherwise. Leases, markers,
+// logs and state.db all live under it, so nothing may be read from the wrong home.
+func (r *Registry) profileHome(profile string) string {
+	if profile == "" || profile == "default" {
+		return r.hermesHome
+	}
+	return filepath.Join(r.hermesHome, "profiles", profile)
+}
+
+// dbFor is the state.db that holds a pane's session.
+func (r *Registry) dbFor(profile string) string {
+	if profile == "" || profile == "default" {
+		return r.dbPath
+	}
+	return filepath.Join(r.profileHome(profile), "state.db")
+}
+
+// profileOf reports the profile of the pane's hermes process, preferring the one
+// that is running.
+func (ps *PaneStatus) profileOf() string {
+	if a := ps.runningAssoc(); a != nil && a.Profile != "" {
+		return a.Profile
+	}
+	for i := range ps.Assocs {
+		if ps.Assocs[i].Profile != "" {
+			return ps.Assocs[i].Profile
+		}
+	}
+	return ""
 }
