@@ -14,10 +14,40 @@ No AI, no screen-content heuristics. All state comes from:
 
 ## Run
 
-    ./tmux-control                  # listens on 127.0.0.1:8790
-    ./tmux-control -listen :8790 -poll 2s -enter-delay 500ms
+    ./tmux-control                          # local mode: listens on 127.0.0.1:8790
+    ./tmux-control -mode local -listen :8790 -poll 2s -enter-delay 500ms
+    ./tmux-control -mode spagetti -env .env # server mode: dials out to a gateway
 
-Background: run under tmux/nohup; it is a plain HTTP daemon.
+Background: run under tmux/nohup; it is a daemon either way.
+
+`-mode` selects how the same REST API is exposed:
+
+- `local` (default) — a plain HTTP listener on `-listen`.
+- `spagetti` — the daemon dials *out* to a spagetti gateway
+  (https://github.com/sannysanoff/spagetti) and serves the API through an
+  end-to-end encrypted channel, so no inbound port is needed. The local listener
+  is not opened in this mode.
+
+## Spagetti mode
+
+Configuration comes from an env file (default `.env`, `-env` to point elsewhere)
+and/or the process environment; the environment wins, and a file only fills gaps.
+Three keys are required and a missing one refuses to start:
+
+    SPAGETTI_GATEWAY=wss://mux.san.systems/ws   # gateway address (http/https map to ws/wss)
+    SPAGETTI_PASSWORD=<server-role bearer token> # the "gateway password": who may register this node
+    SPAGETTI_NAME=solidus-workspace              # node/service name clients ask the gateway for
+
+The identity keypair and the access password are generated on the first run into
+the working directory, using spagetti's own `conf` helpers:
+
+    identity.key      private key, mode 0600 — never leaves this host
+    identity.pub      public key (the pin)
+    access.password   the Noise PSK (the pin), mode 0600
+
+Copy `identity.pub` and `access.password` to a client (`tmux-web`, `spagetti-call pin`) to
+authorise it; a second run reuses the files unchanged. Restart-safe and refuse-to-guess:
+a malformed gateway URL, an empty required key or an unknown mode all fail at startup.
 
 ## Endpoints
 

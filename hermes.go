@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -43,13 +42,19 @@ func LoadLeases(hermesHome string) (map[int]LeaseEntry, error) {
 	return out, nil
 }
 
-// MarkerEntry is one per-tty current-session marker file.
+// MarkerEntry is one per-tty current-session marker file. The marker names the
+// session that a terminal is currently running, so only a recent one counts: a
+// leftover marker from a session that ended would otherwise label a recycled tty
+// with somebody else's conversation.
 type MarkerEntry struct {
 	TTY       string
 	SessionID string
 	CWD       string
 	TS        time.Time
 }
+
+// markerMaxAge bounds how old a marker may be and still be believed.
+const markerMaxAge = 24 * time.Hour
 
 // LoadMarkers reads all ~/.hermes/terminal-sessions/* files.
 func LoadMarkers(hermesHome string) (map[string]MarkerEntry, error) {
@@ -79,66 +84,45 @@ func LoadMarkers(hermesHome string) (map[string]MarkerEntry, error) {
 		if tty == "" {
 			continue
 		}
-		out[tty] = MarkerEntry{TTY: tty, SessionID: m.SessionID, CWD: m.CWD, TS: time.Unix(int64(m.TS), 0)}
+		ts := time.Unix(int64(m.TS), 0)
+		if !ts.IsZero() && time.Since(ts) > markerMaxAge {
+			continue
+		}
+		out[tty] = MarkerEntry{TTY: tty, SessionID: m.SessionID, CWD: m.CWD, TS: ts}
 	}
 	return out, nil
 }
 
-// ttyFromMarkerName converts "tty-dev-pts-19" to "/dev/pts/19" (and
-// "tty-dev-pts-0" to "/dev/pts/0"). Returns "" for unknown shapes.
+// ttyFromMarkerName turns a marker file name into the device path tmux reports,
+// on both platforms: "tty-dev-pts-19" -> "/dev/pts/19" (Linux) and
+// "tty-dev-ttys009" -> "/dev/ttys009" (macOS). Returns "" for unknown shapes.
 func ttyFromMarkerName(name string) string {
 	rest := strings.TrimPrefix(name, "tty-dev-")
-	if rest == name {
+	if rest == name || rest == "" {
 		return ""
 	}
-	i := strings.LastIndex(rest, "-")
-	if i <= 0 {
-		return ""
+	// Linux: <dev>-<num>, where the device has no dash of its own.
+	if i := strings.LastIndex(rest, "-"); i > 0 {
+		dev, num := rest[:i], rest[i+1:]
+		if !strings.Contains(dev, "-") && digitsOnly(num) {
+			return "/dev/" + dev + "/" + num
+		}
 	}
-	dev, num := rest[:i], rest[i+1:]
-	if num == "" {
-		return ""
+	// macOS: the tty name has no number suffix split by a dash.
+	if strings.HasPrefix(rest, "tty") {
+		return "/dev/" + rest
 	}
-	return "/dev/" + dev + "/" + num
+	return ""
 }
 
-// procStartTime reads /proc/PID/stat field 22 in clock ticks.
-func procStartTime(pid int) (float64, error) {
-	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
-	if err != nil {
-		return 0, err
-	}
-	s := string(b)
-	rp := strings.LastIndex(s, ")")
-	if rp < 0 || rp+2 >= len(s) {
-		return 0, os.ErrInvalid
-	}
-	fields := strings.Fields(s[rp+2:])
-	if len(fields) < 20 {
-		return 0, os.ErrInvalid
-	}
-	ticks, err := strconv.ParseFloat(fields[20], 64)
-	if err != nil {
-		return 0, err
-	}
-	return ticks / 100.0, nil
-}
-
-// procAlive reports whether pid exists; if start is a lease epoch timestamp
-// (>1e6), it checks /proc/PID stat mtime-age consistency loosely, else only
-// existence. We deliberately avoid clock-tick math (deterministic + simple).
-func procAlive(pid int, start float64) bool {
-	st, err := os.Stat("/proc/" + strconv.Itoa(pid))
-	if err != nil {
+func digitsOnly(s string) bool {
+	if s == "" {
 		return false
 	}
-	_ = st
-	_ = start
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
 	return true
 }
-
-// AgentLogSession extracts session ids like 20261005_122131_345299 from a
-// log line. Returns the session id and the log timestamp.
-var _ = json.Marshal
-
-var _ = time.Now

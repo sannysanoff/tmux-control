@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -183,7 +182,10 @@ func (r *Registry) scanOnce() {
 		a := PaneAssoc{PID: pr.pid, Running: !pr.suspended, Suspended: pr.suspended, Cmdline: pr.cmdline}
 		if le, ok := leases[pr.pid]; ok && procAlive(pr.pid, le.ProcessStartTime) {
 			a.SessionID = le.LiveSessionID
-			a.Source = "lease"
+			a.Source = SourceLease.String()
+		} else {
+			// found by the process scan alone: no lease names its session
+			a.Source = SourceProc.String()
 		}
 		ttyProcs[pr.tty] = append(ttyProcs[pr.tty], a)
 	}
@@ -249,46 +251,11 @@ func (ps *PaneStatus) runningAssoc() *PaneAssoc {
 	return nil
 }
 
-// hermesProc is one detected hermes process.
+// hermesProc is one detected hermes process, as found by the platform-specific
+// scan (proc_linux.go reads /proc, proc_darwin.go shells out to ps).
 type hermesProc struct {
 	pid       int
 	tty       string
 	suspended bool
 	cmdline   string
-}
-
-// scanHermesProcs finds hermes processes via /proc (deterministic: cmdline
-// contains .hermes/hermes-agent/ and the exe is python from that venv).
-func scanHermesProcs() []hermesProc {
-	ents, err := os.ReadDir("/proc")
-	if err != nil {
-		return nil
-	}
-	var out []hermesProc
-	for _, de := range ents {
-		pid, err := strconv.Atoi(de.Name())
-		if err != nil {
-			continue
-		}
-		cl, err := os.ReadFile("/proc/" + de.Name() + "/cmdline")
-		if err != nil {
-			continue
-		}
-		cmdline := strings.ReplaceAll(string(cl), "\x00", " ")
-		if !hermesProcRe.MatchString(cmdline) {
-			continue
-		}
-		hp := hermesProc{pid: pid, cmdline: strings.TrimSpace(cmdline)}
-		if st, err := os.ReadFile("/proc/" + de.Name() + "/stat"); err == nil {
-			f := strings.Fields(string(st))
-			if len(f) > 2 && f[2] == "T" {
-				hp.suspended = true
-			}
-		}
-		if fd, err := os.Readlink("/proc/" + de.Name() + "/fd/0"); err == nil && strings.HasPrefix(fd, "/dev/pts/") {
-			hp.tty = fd
-		}
-		out = append(out, hp)
-	}
-	return out
 }
