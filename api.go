@@ -54,6 +54,9 @@ func (r *Registry) Routes() http.Handler {
 	m.HandleFunc("GET /sessions/{id}/pane", r.handlePane)
 	m.HandleFunc("GET /sessions/{id}/messages", r.handleMessages)
 	m.HandleFunc("GET /sessions/{id}/events", gzipIfAccepted(r.handleEvents))
+	m.HandleFunc("GET /sessions/{id}/tree", r.handleTree)
+	m.HandleFunc("GET /sessions/{id}/child-events", gzipIfAccepted(r.handleChildEvents))
+	m.HandleFunc("GET /sessions/{id}/exec", gzipIfAccepted(r.handleExec))
 	m.HandleFunc("POST /sessions/{id}/break", r.handleBreak)
 	m.HandleFunc("POST /sessions/{id}/send", r.handleSend)
 	m.HandleFunc("POST /sessions/{id}/paste", r.handlePaste)
@@ -315,6 +318,165 @@ func (r *Registry) handleEvents(w http.ResponseWriter, req *http.Request) {
 		"last_id":    last,
 		"has_more":   len(events) == limit,
 		"events":     events,
+	})
+}
+
+// handleTree serves GET /sessions/{id}/tree: the session's subagent children
+// and the delegate_task calls that spawned them, read from the session's own
+// profile database. A session id that has no row answers 404 — the tree is a
+// database view, not a pane view.
+func (r *Registry) handleTree(w http.ResponseWriter, req *http.Request) {
+	sid := req.PathValue("id")
+	// The tree is a database view, not a pane view: the parent is usually a
+	// session that has already ended and sits on no pane, so the db is found
+	// by probing the profile homes; the pane association, when there is one,
+	// still wins (it names the profile directly).
+	db := ""
+	if _, ps, err := r.findPaneBySession(sid); err == nil {
+		db = r.dbFor(ps.Profile)
+	}
+	if db == "" {
+		db = r.dbForSession(sid)
+	}
+	if db == "" {
+		writeErr(w, http.StatusNotFound, "session "+sid+" not found in any profile database")
+		return
+	}
+	tree, err := LoadSessionTree(db, sid)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeErr(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, tree)
+}
+
+// handleChildEvents serves GET /sessions/{id}/child-events?child=ID&limit=N&max_chars=C:
+// one subagent child's whole event stream, for the console's session-tree tab.
+// The daemon gates it: only a real subagent child of {id} is ever served, so
+// the route is not a general history export.
+func (r *Registry) handleChildEvents(w http.ResponseWriter, req *http.Request) {
+	sid := req.PathValue("id")
+	child := req.URL.Query().Get("child")
+	if child == "" {
+		writeErr(w, http.StatusBadRequest, "child is required")
+		return
+	}
+	limit := 2000
+	if req.URL.Query().Has("limit") {
+		n, err := strconv.Atoi(req.URL.Query().Get("limit"))
+		if err != nil || n <= 0 || n > 5000 {
+			writeErr(w, http.StatusBadRequest, "invalid limit: 1..5000")
+			return
+		}
+		limit = n
+	}
+	maxChars := 2000
+	if req.URL.Query().Has("max_chars") {
+		n, err := strconv.Atoi(req.URL.Query().Get("max_chars"))
+		if err != nil || n <= 0 || n > 200000 {
+			writeErr(w, http.StatusBadRequest, "invalid max_chars: 1..200000")
+			return
+		}
+		maxChars = n
+	}
+	db := ""
+	if _, ps, err := r.findPaneBySession(sid); err == nil {
+		db = r.dbFor(ps.Profile)
+	}
+	if db == "" {
+		db = r.dbForSession(sid)
+	}
+	if db == "" {
+		writeErr(w, http.StatusNotFound, "session "+sid+" not found in any profile database")
+		return
+	}
+	events, err := LoadChildEvents(db, sid, child, limit, maxChars)
+	if err != nil {
+		if strings.Contains(err.Error(), "is not a subagent") {
+			writeErr(w, http.StatusForbidden, err.Error())
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session_id": sid, "child_id": child, "count": len(events), "events": events,
+	})
+}
+
+// handleExec serves GET /sessions/{id}/exec?since_id=&limit=&max_chars= — the
+// parent's event stream plus the delegate_task calls in view and the subagent
+// sessions each spawned. Same shape of query parameters as /events, so the
+// console pages it the same way; the db is the pane's profile when the parent
+// is on one, else the profile probe (a finished parent sits on no pane).
+func (r *Registry) handleExec(w http.ResponseWriter, req *http.Request) {
+	sid := req.PathValue("id")
+	db := ""
+	if _, ps, err := r.findPaneBySession(sid); err == nil {
+		db = r.dbFor(ps.Profile)
+	}
+	if db == "" {
+		db = r.dbForSession(sid)
+	}
+	if db == "" {
+		writeErr(w, http.StatusNotFound, "session "+sid+" not found in any profile database")
+		return
+	}
+	q := req.URL.Query()
+	var sinceID int64
+	if q.Has("since_id") {
+		n, err := strconv.ParseInt(q.Get("since_id"), 10, 64)
+		if err != nil || n < 0 {
+			writeErr(w, http.StatusBadRequest, "invalid since_id: must be a non-negative integer")
+			return
+		}
+		sinceID = n
+	}
+	limit := 500
+	if q.Has("limit") {
+		n, err := strconv.Atoi(q.Get("limit"))
+		if err != nil || n <= 0 {
+			writeErr(w, http.StatusBadRequest, "invalid limit: must be a positive integer")
+			return
+		}
+		if n > 2000 {
+			n = 2000
+		}
+		limit = n
+	}
+	maxChars := 2000
+	if q.Has("max_chars") {
+		n, err := strconv.Atoi(q.Get("max_chars"))
+		if err != nil || n <= 0 {
+			writeErr(w, http.StatusBadRequest, "invalid max_chars: must be a positive integer")
+			return
+		}
+		if n > 200000 {
+			n = 200000
+		}
+		maxChars = n
+	}
+	events, names, err := LoadSessionExec(db, sid, sinceID, limit, maxChars)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	last := sinceID
+	if len(events) > 0 {
+		last = events[len(events)-1].ID
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session_id": sid,
+		"count":      len(events),
+		"last_id":    last,
+		"has_more":   len(events) == limit,
+		"events":     events,
+		"calls":      names.Calls,
+		"kids":       names.Kids,
 	})
 }
 

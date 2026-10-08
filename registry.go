@@ -388,6 +388,43 @@ func (r *Registry) dbFor(profile string) string {
 	return filepath.Join(r.profileHome(profile), "state.db")
 }
 
+// dbForSession finds the state.db that holds a session row, without a pane:
+// the profile db of every known profile is probed in turn. It is the fallback
+// for routes that serve a session's history rather than its pane — the tree
+// routes — because a subagent's parent is usually a session that has already
+// ended and therefore sits on no pane at all. "" when nowhere.
+func (r *Registry) dbForSession(sid string) string {
+	lit := idLiteral(sid)
+	if lit == "" {
+		return ""
+	}
+	probe := func(db string) bool {
+		rows, err := sqliteJSON(db, "SELECT count(*) AS n FROM sessions WHERE id = "+lit, nil)
+		return err == nil && len(rows) > 0 && asFloat(rows[0]["n"]) > 0
+	}
+	profiles := []string{""}
+	if entries, err := os.ReadDir(filepath.Join(r.hermesHome, "profiles")); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				profiles = append(profiles, e.Name())
+			}
+		}
+	}
+	for _, p := range profiles {
+		db := r.dbFor(p)
+		if db == "" {
+			continue
+		}
+		if _, err := os.Stat(db); err != nil {
+			continue
+		}
+		if probe(db) {
+			return db
+		}
+	}
+	return ""
+}
+
 // profileOf reports the profile of the pane's hermes process, preferring the one
 // that is running.
 func (ps *PaneStatus) profileOf() string {
