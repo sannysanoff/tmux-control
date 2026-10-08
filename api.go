@@ -57,6 +57,12 @@ func (r *Registry) Routes() http.Handler {
 	m.HandleFunc("POST /sessions/{id}/break", r.handleBreak)
 	m.HandleFunc("POST /sessions/{id}/send", r.handleSend)
 	m.HandleFunc("POST /sessions/{id}/paste", r.handlePaste)
+	m.HandleFunc("GET /sessions/{id}/rhermes/status", r.handleRhermesStatus)
+	m.HandleFunc("GET /sessions/{id}/rhermes/frames", r.handleRhermesFrames)
+	m.HandleFunc("POST /sessions/{id}/rhermes/prompt", r.handleRhermesPrompt)
+	m.HandleFunc("POST /sessions/{id}/rhermes/send", r.handleRhermesSend)
+	m.HandleFunc("POST /sessions/{id}/rhermes/stop", r.handleRhermesStop)
+	m.HandleFunc("GET /rhermes", r.handleRhermesList)
 	m.HandleFunc("GET /health", r.handleHealth)
 	return m
 }
@@ -145,6 +151,7 @@ func (r *Registry) handleListSessions(w http.ResponseWriter, req *http.Request) 
 			if le, ok := msgs[ps.SessionID]; ok {
 				ps.LastQuery = le.LastQuery
 				ps.LastAnswer = le.LastAnswer
+				ps.Steps = le.Steps
 			}
 			if ts, ok := r.turnState[ps.SessionID]; ok {
 				tt := ts
@@ -349,6 +356,10 @@ func (r *Registry) handleSend(w http.ResponseWriter, req *http.Request) {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
+	if r.useSocket(ps) {
+		r.rhermesPromptThroughSend(w, sid, ps, body.Text)
+		return
+	}
 	if ps == nil || !ps.Running {
 		writeErr(w, http.StatusConflict, "session is not running in a pane")
 		return
@@ -359,6 +370,22 @@ func (r *Registry) handleSend(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+// rhermesPromptThroughSend answers a keystrokes-shaped request with the socket
+// transport: the text becomes a prompt.submit, and the reply carries "via":
+// "rhermes" so a caller can see which way it went. An error is 502, not 500 —
+// the pane is fine; the shim refused.
+func (r *Registry) rhermesPromptThroughSend(w http.ResponseWriter, sid string, ps *PaneStatus, text string) {
+	res, err := (rhermesClient{path: ps.RhermesPath}).prompt(text, 30*time.Second)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session_id": sid, "pid": ps.RhermesPID, "socket": ps.RhermesPath,
+		"via": "rhermes", "result": res,
+	})
 }
 
 func (r *Registry) handlePaste(w http.ResponseWriter, req *http.Request) {
@@ -381,6 +408,10 @@ func (r *Registry) handlePaste(w http.ResponseWriter, req *http.Request) {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
+	if r.useSocket(ps) {
+		r.rhermesPromptThroughSend(w, sid, ps, body.Text)
+		return
+	}
 	if ps == nil || !ps.Running {
 		writeErr(w, http.StatusConflict, "session is not running in a pane")
 		return
@@ -391,4 +422,178 @@ func (r *Registry) handlePaste(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+// rhermesOf resolves a session id to the pane's rhermes shim: its socket path,
+// pid and the pane it sits in. A session without a shim answers "no rhermes".
+func (r *Registry) rhermesOf(sid string) (PaneID, *PaneStatus, string, int, error) {
+	pid, ps, err := r.findPaneBySession(sid)
+	if err != nil {
+		return "", nil, "", 0, err
+	}
+	if ps == nil || ps.RhermesPath == "" {
+		return "", nil, "", 0, fmt.Errorf("session %s has no rhermes shim on its pane", sid)
+	}
+	return pid, ps, ps.RhermesPath, ps.RhermesPID, nil
+}
+
+// useSocket decides the access mode for one pane. "auto" means the socket when
+// the pane actually has a shim — the default, so nothing changes for panes
+// that run the TUI bare.
+func (r *Registry) useSocket(ps *PaneStatus) bool {
+	switch r.rhermesAccess {
+	case "socket":
+		return ps != nil && ps.RhermesPath != ""
+	case "auto":
+		return ps != nil && ps.RhermesPath != ""
+	default: // keystrokes
+		return false
+	}
+}
+
+// handleRhermesList serves GET /rhermes: every live shim, followed or not.
+func (r *Registry) handleRhermesList(w http.ResponseWriter, req *http.Request) {
+	insts := discoverRhermes()
+	out := make([]map[string]any, 0, len(insts))
+	for _, inst := range insts {
+		m := map[string]any{"pid": inst.PID, "socket": inst.Path}
+		if st, err := (rhermesClient{path: inst.Path}).status(); err == nil {
+			m["status"] = st
+		} else {
+			m["note"] = err.Error()
+		}
+		out = append(out, m)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"updated": r.updated, "instances": out})
+}
+
+// handleRhermesStatus serves GET /sessions/{id}/rhermes/status.
+func (r *Registry) handleRhermesStatus(w http.ResponseWriter, req *http.Request) {
+	sid := req.PathValue("id")
+	_, _, path, rpid, err := r.rhermesOf(sid)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	st, err := (rhermesClient{path: path}).status()
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	st.Followed = followerFor(path) != nil
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session_id": sid, "pid": rpid, "socket": path, "status": st,
+	})
+}
+
+// handleRhermesFrames serves GET /sessions/{id}/rhermes/frames?limit=N: the
+// non-blocking pull. Every frame the follower saw since the last drain, up to
+// limit (default all), oldest first; the buffer empties as it serves.
+func (r *Registry) handleRhermesFrames(w http.ResponseWriter, req *http.Request) {
+	sid := req.PathValue("id")
+	_, _, path, rpid, err := r.rhermesOf(sid)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	limit := 0
+	if req.URL.Query().Has("limit") {
+		n, err := strconv.Atoi(req.URL.Query().Get("limit"))
+		if err != nil || n < 0 {
+			writeErr(w, http.StatusBadRequest, "invalid limit: must be a non-negative integer")
+			return
+		}
+		limit = n
+	}
+	f := followerFor(path)
+	if f == nil {
+		writeErr(w, http.StatusBadGateway, "no follower for "+path)
+		return
+	}
+	frames, dropped := f.drain(limit)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session_id": sid, "pid": rpid, "socket": path,
+		"count": len(frames), "dropped": dropped, "frames": frames,
+	})
+}
+
+// handleRhermesPrompt serves POST /sessions/{id}/rhermes/prompt {text}: inject
+// a user turn through the shim. It waits for the shim's streaming ack so the
+// caller learns the turn started; the answer itself arrives as frames.
+func (r *Registry) handleRhermesPrompt(w http.ResponseWriter, req *http.Request) {
+	sid := req.PathValue("id")
+	var body struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	if body.Text == "" {
+		writeErr(w, http.StatusBadRequest, "text is required")
+		return
+	}
+	_, _, path, rpid, err := r.rhermesOf(sid)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	res, err := (rhermesClient{path: path}).prompt(body.Text, 30*time.Second)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session_id": sid, "pid": rpid, "socket": path, "via": "rhermes", "result": res,
+	})
+}
+
+// handleRhermesSend serves POST /sessions/{id}/rhermes/send {method, params}:
+// an arbitrary JSON-RPC call through the shim.
+func (r *Registry) handleRhermesSend(w http.ResponseWriter, req *http.Request) {
+	sid := req.PathValue("id")
+	var body struct {
+		Method string `json:"method"`
+		Params any    `json:"params"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	if body.Method == "" {
+		writeErr(w, http.StatusBadRequest, "method is required")
+		return
+	}
+	_, _, path, rpid, err := r.rhermesOf(sid)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	res, err := (rhermesClient{path: path}).send(body.Method, body.Params, 30*time.Second)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session_id": sid, "pid": rpid, "socket": path, "via": "rhermes", "result": res,
+	})
+}
+
+// handleRhermesStop serves POST /sessions/{id}/rhermes/stop: tear the whole
+// rhermes instance down (TUI included). A destructive act, so it says so in the
+// reply.
+func (r *Registry) handleRhermesStop(w http.ResponseWriter, req *http.Request) {
+	sid := req.PathValue("id")
+	_, _, path, rpid, err := r.rhermesOf(sid)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err := (rhermesClient{path: path}).stop(); err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session_id": sid, "pid": rpid, "socket": path, "stopped": true,
+	})
 }

@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""rhermes — run `hermes --tui` with the runtime exposed on a socket.
+
+The node TUI normally spawns its own python runtime and talks JSON-RPC to it
+over hidden pipes. rhermes inserts itself in that seam: it starts the real
+runtime (`python -m tui_gateway.entry`) as its own child, bridges the node's
+WebSocket to the runtime's stdio JSONL, and opens a unix control socket at
+/tmp/rhermes.<pid> where any local process can watch every frame, inject
+turns, and run arbitrary RPCs — while the TUI stays a normal terminal you
+type into by hand.
+
+rhermes itself is only the runner: it launches and it exposes; clients of the
+socket are expected to speak the line-delimited ctl protocol directly.
+
+Usage:
+
+  rhermes [hermes-tui-args...]     launch (foreground; Ctrl-C as usual)
+
+One control file per instance: the socket itself, /tmp/rhermes.<pid>, named
+by the shim's pid — finding the pid is finding the socket. The socket speaks
+line-delimited JSON:
+
+  {"ctl":"ping"|"status"}            -> one status line
+  {"ctl":"follow"}                   -> mirror every frame to this connection
+  {"ctl":"prompt","text":T}          -> inject a user turn (prompt.submit)
+  {"ctl":"send","method":M,"params":P} -> arbitrary JSON-RPC to the runtime
+  {"ctl":"stop"}                     -> shut the whole thing down
+
+Frames injected get id "inj-<n>"; their responses are mirrored to the
+injecting connection and hidden from the node. Everything else on the wire is
+mirrored to taps marked {"tap":"up"|"down"}.
+
+Env:
+  RHERMES_PORT   WS port for the TUI    (default 47191)
+  RHERMES_SOCK   override ctl socket    (default /tmp/rhermes.<pid>)
+  RHERMES_PY     python for the runtime child (default: this interpreter)
+  HERMES_SRC     hermes-agent checkout (default /Users/san/.hermes/hermes-agent)
+
+The TUI process itself is the stock launcher (`hermes --tui ...`): profiles,
+terminal config, resume/worktree flags all behave exactly as without rhermes.
+The launcher passes HERMES_TUI_GATEWAY_URL through, and node — seeing it —
+attaches to us instead of spawning its own runtime child.
+"""
+
+import asyncio
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+HERMES_SRC = os.environ.get("HERMES_SRC", "/Users/san/.hermes/hermes-agent")
+SOCK = os.environ.get("RHERMES_SOCK") or f"/tmp/rhermes.{os.getpid()}"
+PORT = int(os.environ.get("RHERMES_PORT", "47191"))
+CHILD_PY = os.environ.get("RHERMES_PY", sys.executable)
+
+try:
+    import websockets
+except ImportError:
+    # the system python lacks websockets; the hermes venv has it — re-exec there
+    import sys as _s
+    _venv = os.path.join(HERMES_SRC, "venv/bin/python")
+    if os.path.exists(_venv) and _s.executable != os.path.realpath(_venv):
+        os.execv(_venv, [_venv, __file__] + _s.argv[1:])
+    raise
+
+
+# --------------------------------------------------------------------------- state
+
+
+class Hub:
+    def __init__(self):
+        self.started = time.time()
+        self.child = None                # tui_gateway.entry process
+        self.tui_proc = None             # `hermes --tui` launcher process
+        self.ws_client = None            # the one attached TUI
+        self.taps = set()                # ctl connections marked {"ctl":"follow"}
+        self.injectors = set()           # ctl connections currently awaiting an inj response
+        self.live_sid = None             # last session_id seen on the wire (prompt.submit / resume)
+        self.stored_sid = None           # session.create result's stored_session_id
+        self.frames_up = 0               # node -> python
+        self.frames_down = 0             # python -> node
+        self.inj_seq = 0
+        self.stopping = False
+
+    def note_session(self, obj: dict) -> None:
+        """Pick session ids out of any frame passing by."""
+        try:
+            params = obj.get("params") or {}
+            result = obj.get("result") or {}
+            m = obj.get("method") or ""
+            if m == "session.create" and isinstance(result, dict):
+                self.stored_sid = result.get("stored_session_id") or result.get("session_id") or self.stored_sid
+            sid = None
+            if isinstance(params, dict) and params.get("session_id"):
+                sid = params["session_id"]
+            elif isinstance(result, dict) and result.get("session_id") and m != "session.create":
+                sid = result["session_id"]
+            if sid:
+                self.live_sid = sid
+        except Exception:
+            pass
+
+    def next_inj_id(self) -> str:
+        self.inj_seq += 1
+        return f"inj-{self.inj_seq}"
+
+
+hub = Hub()
+
+# --------------------------------------------------------------------------- bridging
+
+
+async def ws_handler(ws):
+    """The TUI's WebSocket: raw bidirectional bridge to the runtime child."""
+    if hub.ws_client is not None:
+        # One TUI per runtime; a second attach would fork the session state.
+        await ws.close(code=4500, reason="rhermes: TUI already attached")
+        return
+    hub.ws_client = ws
+    try:
+        await bridge_until_closed(ws)
+    finally:
+        hub.ws_client = None
+
+
+async def pump_ws_to_child(ws, child_stdin):
+    loop = asyncio.get_running_loop()
+    while True:
+        raw = await ws.recv()
+        if raw is None:
+            break
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        hub.frames_up += 1
+        try:
+            hub.note_session(json.loads(raw))
+        except Exception:
+            pass
+        await tap_broadcast("up", raw)
+        child_stdin.write(raw.encode() + b"\n")
+        child_stdin.flush()
+
+
+async def pump_child_to_ws(child_stdout, send_ws):
+    loop = asyncio.get_running_loop()
+    while True:
+        line = await loop.run_in_executor(None, child_stdout.readline)
+        if not line:
+            break
+        text = line.decode("utf-8", "replace").strip()
+        if not text:
+            continue
+        await route_downstream(text, send_ws)
+
+
+async def route_downstream(text, send_ws):
+    """A frame from the runtime: route by id, mirror to taps."""
+    hub.frames_down += 1
+    frame = None
+    try:
+        frame = json.loads(text)
+    except Exception:
+        pass
+    inj = False
+    if isinstance(frame, dict):
+        rid = frame.get("id")
+        hub.note_session(frame)
+        inj = isinstance(rid, str) and rid.startswith("inj-")
+        if inj:
+            # Answer to OUR injection: only the injectors care; node must not
+            # see a response id it never issued (it drops it, but keep the
+            # wire clean anyway).
+            await tap_broadcast("down", text, inj_only=True)
+            return
+    await tap_broadcast("down", text)
+    try:
+        await send_ws(text)
+    except Exception:
+        pass
+
+
+async def bridge_until_closed(ws):
+    """Spawn the runtime on first attach and pump until either side dies."""
+    proc = hub.child
+    if proc is None or proc.poll() is not None:
+        proc = spawn_runtime()
+        hub.child = proc
+
+    loop = asyncio.get_running_loop()
+    t1 = asyncio.ensure_future(pump_ws_to_child(ws, proc.stdin))
+    t2 = asyncio.ensure_future(pump_child_to_ws(proc.stdout, lambda t: ws.send(t)))
+
+    def _watch_child():
+        rc = proc.wait()
+        # Runtime died: close the WS so the TUI reconnects (and we respawn).
+        asyncio.run_coroutine_threadsafe(ws.close(code=1011), loop)
+
+    threading_watch = asyncio.ensure_future(asyncio.get_running_loop().run_in_executor(None, _watch_child))
+    try:
+        done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            exc = t.exception()
+            if exc and not isinstance(exc, (ConnectionClosedOK,)):
+                pass  # normal on disconnect
+    finally:
+        for t in (t1, t2):
+            t.cancel()
+        threading_watch.cancel()
+
+
+from websockets.exceptions import ConnectionClosedOK  # noqa: E402
+
+
+def spawn_runtime():
+    env = dict(os.environ)
+    env.setdefault("HERMES_PYTHON_SRC_ROOT", HERMES_SRC)
+    src = HERMES_SRC
+    pypath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = f"{src}{os.pathsep}{pypath}" if pypath else src
+    env.setdefault("HERMES_STDIO_RPC", "1")  # harmless if unknown; entry runs regardless
+    proc = subprocess.Popen(
+        [CHILD_PY, "-m", "tui_gateway.entry"],
+        cwd=env.get("HERMES_CWD") or os.getcwd(),
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=sys.stderr,
+    )
+    return proc
+
+
+# --------------------------------------------------------------------------- ctl socket
+
+
+async def ctl_handler(reader, writer):
+    peer = writer.get_extra_info("peername")
+    tap = False
+    try:
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", "replace").strip()
+            if not text:
+                continue
+            obj = None
+            try:
+                obj = json.loads(text)
+            except Exception:
+                obj = None
+            if isinstance(obj, dict) and "ctl" in obj:
+                verb = obj.get("ctl")
+                if verb == "follow":
+                    tap = True
+                    hub.taps.add(writer)
+                    ctl_reply(writer, {"ctl": "follow", "ok": True})
+                elif verb in ("ping", "status"):
+                    ctl_reply(writer, ctl_status())
+                elif verb == "stop":
+                    ctl_reply(writer, {"ctl": "stop", "ok": True})
+                    asyncio.ensure_future(shutdown())
+                elif verb == "prompt":
+                    await ctl_prompt(writer, obj)
+                elif verb == "send":
+                    await ctl_send(writer, obj)
+                else:
+                    ctl_reply(writer, {"ctl": verb, "error": "unknown verb"})
+                continue
+            # Raw JSONL: forward to the runtime as if the TUI sent it.
+            await inject_raw(writer, text)
+    except (ConnectionResetError, BrokenPipeError):
+        pass
+    finally:
+        hub.taps.discard(writer)
+        hub.injectors.discard(writer)
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+def ctl_reply(writer, obj):
+    try:
+        writer.write((json.dumps(obj, ensure_ascii=False) + "\n").encode())
+    except Exception:
+        pass
+
+
+def ctl_status():
+    return {
+        "ctl": "status",
+        "active_session": hub.live_sid,
+        "tui_attached": hub.ws_client is not None,
+        "runtime_child": (hub.child.pid if hub.child and hub.child.poll() is None else None),
+        "tui_pid": (hub.tui_proc.pid if hub.tui_proc and hub.tui_proc.poll() is None else None),
+        "frames_up": hub.frames_up,
+        "frames_down": hub.frames_down,
+        "taps": len(hub.taps),
+        "uptime_s": int(time.time() - hub.started),
+    }
+
+
+async def ctl_prompt(writer, obj):
+    text = obj.get("text") or ""
+    if not text.strip():
+        ctl_reply(writer, {"ctl": "prompt", "error": "empty text"})
+        return
+    if hub.child is None or hub.child.poll() is not None:
+        ctl_reply(writer, {"ctl": "prompt", "error": "runtime not running (TUI not attached yet?)"})
+        return
+    sid = obj.get("session_id") or hub.live_sid
+    if not sid:
+        ctl_reply(writer, {"ctl": "prompt", "error": "no active session seen yet on the wire"})
+        return
+    rid = hub.next_inj_id()
+    frame = {"jsonrpc": "2.0", "id": rid, "method": "prompt.submit",
+             "params": {"session_id": sid, "text": text}}
+    hub.injectors.add(writer)
+    await inject_frame(frame)
+    ctl_reply(writer, {"ctl": "prompt", "ok": True, "id": rid, "session_id": sid})
+
+
+async def ctl_send(writer, obj):
+    method = obj.get("method")
+    if not method:
+        ctl_reply(writer, {"ctl": "send", "error": "no method"})
+        return
+    if hub.child is None or hub.child.poll() is not None:
+        ctl_reply(writer, {"ctl": "send", "error": "runtime not running"})
+        return
+    params = obj.get("params")
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except Exception:
+            ctl_reply(writer, {"ctl": "send", "error": "params is not JSON"})
+            return
+    rid = hub.next_inj_id()
+    frame = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params if params is not None else {}}
+    if method in ("session.resume", "prompt.submit") and isinstance(params, dict) and not params.get("session_id"):
+        if hub.live_sid:
+            frame["params"]["session_id"] = hub.live_sid
+    hub.injectors.add(writer)
+    await inject_frame(frame)
+    ctl_reply(writer, {"ctl": "send", "ok": True, "id": rid, "method": method})
+
+
+async def inject_raw(writer, text):
+    """Raw frame from an injector: mark its id as ours if it carries one."""
+    try:
+        frame = json.loads(text)
+        if isinstance(frame, dict) and frame.get("id") is not None and frame.get("method"):
+            frame["id"] = hub.next_inj_id() if not str(frame["id"]).startswith("inj-") else frame["id"]
+            text = json.dumps(frame, ensure_ascii=False)
+    except Exception:
+        ctl_reply(writer, {"ctl": "raw", "error": "not JSON"})
+        return
+    await inject_frame_from_text(text)
+
+
+async def inject_frame(frame):
+    await inject_frame_from_text(json.dumps(frame, ensure_ascii=False))
+
+
+async def inject_frame_from_text(text):
+    if hub.child is None or hub.child.poll() is not None or hub.child.stdin is None:
+        return
+    try:
+        text.encode("utf-8")
+    except Exception:
+        text = text.encode("utf-8", "replace").decode("utf-8")
+    hub.frames_up += 1
+    await tap_broadcast("inj", text)
+    hub.child.stdin.write(text.encode() + b"\n")
+    hub.child.stdin.flush()
+
+
+async def tap_broadcast(direction, text, inj_only=False):
+    targets = hub.injectors if inj_only else (hub.taps | hub.injectors)
+    if not targets:
+        return
+    # every tap line is one envelope: direction plus the raw frame as a string,
+    # so a reader never has to guess where a frame ends or which way it went
+    line = None
+    dead = []
+    for w in list(targets):
+        try:
+            if line is None:
+                line = (json.dumps({"tap": direction, "line": text}, ensure_ascii=False) + "\n").encode()
+            w.write(line)
+        except Exception:
+            dead.append(w)
+    for w in dead:
+        hub.taps.discard(w)
+        hub.injectors.discard(w)
+
+
+# --------------------------------------------------------------------------- lifecycle
+
+
+def cleanup_paths():
+    try:
+        os.unlink(SOCK)
+    except OSError:
+        pass
+
+
+async def shutdown():
+    hub.stopping = True
+    loop = asyncio.get_running_loop()
+    # SIGTERM the stock launcher: it kills node, node tears down its WS.
+    if hub.tui_proc and hub.tui_proc.poll() is None:
+        try:
+            hub.tui_proc.send_signal(signal.SIGTERM)
+        except Exception:
+            pass
+    if hub.child and hub.child.poll() is None:
+        try:
+            hub.child.terminate()
+        except Exception:
+            pass
+    await asyncio.sleep(1.5)
+    for p in (hub.child, hub.tui_proc):
+        if p and p.poll() is None:
+            try:
+                p.kill()
+            except Exception:
+                pass
+    cleanup_paths()
+    os._exit(0)
+
+
+async def amain(argv):
+    loop = asyncio.get_running_loop()
+    if os.path.exists(SOCK):
+        os.unlink(SOCK)
+
+    async def _ws():
+        server = await websockets.serve(ws_handler, "127.0.0.1", PORT)
+        await server.wait_closed()
+
+    ws_task = asyncio.ensure_future(_ws())
+    ctl_server = await asyncio.start_unix_server(ctl_handler, path=SOCK)
+    ctl_task = asyncio.ensure_future(ctl_server.serve_forever())
+
+    # Foreground TUI: the stock launcher does ALL the launch work (env, node
+    # build, resume flags); we only add the attach variable.
+    env = dict(os.environ)
+    env["HERMES_TUI_GATEWAY_URL"] = f"ws://127.0.0.1:{PORT}/api/ws"
+    tui_args = [a for a in argv if a != "--tui"]
+    argv_full = [shutil.which("hermes") or os.path.join(HERMES_SRC, "hermes"), "--tui"] + tui_args
+    hub.tui_proc = subprocess.Popen(argv_full, env=env)
+
+    while not hub.stopping and hub.tui_proc.poll() is None:
+        await asyncio.sleep(0.3)
+    if not hub.stopping:
+        # TUI exited on its own; give the runtime a moment, then wind down.
+        await asyncio.sleep(0.5)
+    if hub.child and hub.child.poll() is None:
+        hub.child.terminate()
+    ws_task.cancel()
+    ctl_task.cancel()
+    cleanup_paths()
+
+
+def main():
+    try:
+        asyncio.run(amain(sys.argv[1:]))
+    except KeyboardInterrupt:
+        pass
+
+
+
+if __name__ == "__main__":
+    main()

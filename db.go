@@ -26,10 +26,16 @@ type MsgRow struct {
 	Timestamp string `json:"ts"`
 }
 
-// LastExchange holds the most recent human query and agent answer.
+// LastExchange holds the most recent human query and agent answer, plus how many
+// tool calls the agent has made since that query — the step count a console can
+// show without reading the database itself.
 type LastExchange struct {
 	LastQuery  *MsgRow `json:"last_query,omitempty"`
 	LastAnswer *MsgRow `json:"last_answer,omitempty"`
+	// Steps is the number of tool rows after the last human question. It is what
+	// "it is working" looks like as a number, and it survives the query/answer pair
+	// not changing while the agent works through a long turn.
+	Steps int `json:"steps_since_query,omitempty"`
 }
 
 // EventRow is one message of ANY role, unlike MsgRow: the console keeps a local
@@ -41,6 +47,7 @@ type EventRow struct {
 	ID        int64  `json:"id"`
 	Role      string `json:"role"`
 	Content   string `json:"content,omitempty"`
+	Reasoning string `json:"reasoning,omitempty"`
 	ToolName  string `json:"tool_name,omitempty"`
 	ToolCalls string `json:"tool_calls,omitempty"`
 	TS        string `json:"ts"`
@@ -79,6 +86,7 @@ func LoadEvents(dbPath, sid string, sinceID int64, limit, maxChars int) ([]Event
 		return out, nil
 	}
 	q := `SELECT id AS id, role AS role, coalesce(content,'') AS content,
+	  coalesce(reasoning_content,'') AS reasoning,
 	  coalesce(tool_name,'') AS tool_name, coalesce(tool_calls,'') AS tool_calls,
 	  strftime('%Y-%m-%dT%H:%M:%SZ', timestamp, 'unixepoch') AS ts
 	  FROM messages WHERE session_id = ` + lit + ` AND id > ` + strconv.FormatInt(sinceID, 10) + `
@@ -94,6 +102,12 @@ func LoadEvents(dbPath, sid string, sinceID int64, limit, maxChars int) ([]Event
 			ToolName:  asString(r["tool_name"]),
 			ToolCalls: clip(asString(r["tool_calls"]), maxChars),
 			TS:        asString(r["ts"]),
+		}
+		// The agent's own thinking is clipped like a tool row rather than kept
+		// whole: it is the biggest column in the table by far, and a reader that
+		// wants to know what the turn is doing needs its gist, not its length.
+		if e.Role == "assistant" {
+			e.Reasoning = clip(asString(r["reasoning"]), maxChars)
 		}
 		switch e.Role {
 		case "tool", "system":
@@ -237,6 +251,48 @@ func LoadLastMessages(dbPath string, ids []string) (map[string]LastExchange, err
 			le.LastAnswer = &m
 		}
 		res[sid] = le
+	}
+	// One more query for the step counts: a second statement against the same
+	// database is a second connection, and folding it into the query above would
+	// mean a correlated subquery per message row.
+	steps, err := LoadStepsSinceQuery(dbPath, ids)
+	if err != nil {
+		return res, nil // the counts are a nicety; the queries and answers are not
+	}
+	for sid, n := range steps {
+		le := res[sid]
+		le.Steps = n
+		res[sid] = le
+	}
+	return res, nil
+}
+
+// LoadStepsSinceQuery counts, per session, the tool rows that follow the last human
+// question: a turn's progress as a number the console can put beside the clock.
+// A session whose last question is gone from the table counts all of its tools,
+// which is honest for "since the last question" — there is none.
+func LoadStepsSinceQuery(dbPath string, ids []string) (map[string]int, error) {
+	res := map[string]int{}
+	in := idList(ids)
+	if in == "" {
+		return res, nil
+	}
+	q := `WITH lastuser AS (
+		  SELECT session_id, max(id) AS uid FROM messages
+		  WHERE role = 'user' AND session_id IN (` + in + `)
+		  GROUP BY session_id
+		)
+		SELECT m.session_id AS session_id, count(*) AS steps
+		FROM messages m LEFT JOIN lastuser u ON u.session_id = m.session_id
+		WHERE m.role = 'tool' AND m.session_id IN (` + in + `)
+		  AND m.id > coalesce(u.uid, 0)
+		GROUP BY m.session_id`
+	rows, err := sqliteJSON(dbPath, q, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		res[asString(r["session_id"])] = int(asFloat(r["steps"]))
 	}
 	return res, nil
 }

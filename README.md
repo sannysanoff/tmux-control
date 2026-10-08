@@ -68,6 +68,17 @@ Pane objects carry `aliases`: all tmux session names that reference the pane
 (workspace groupings), so the same terminal reachable from multiple tmux
 sessions/workspaces is one entry with several names.
 
+## rhermes
+
+A pane running [rhermes](rhermes) (the stock TUI with its runtime exposed on
+the control socket `/tmp/rhermes.<pid>`) is detected and marked on the pane
+(`rhermes_pid`, `rhermes_socket`, `rhermes`). Such a session is driven through
+that socket instead of pushed keystrokes: `-rhermes-access auto` (the default)
+routes `/send` and `/paste` through the shim when the pane has one; direct
+control lives at `/sessions/{id}/rhermes/{status,frames,prompt,send,stop}`,
+where `/frames` is the non-blocking pull of every wire frame the daemon's tap
+connection saw. See APIREF.md for the shapes.
+
 ## Association logic (deterministic)
 
 1. tmux panes are enumerated with unique pane ids (`%N`).

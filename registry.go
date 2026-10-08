@@ -47,20 +47,27 @@ type PaneAssoc struct {
 
 // PaneStatus describes one tmux pane and its hermes association.
 type PaneStatus struct {
-	Pane          Pane        `json:"pane"`
-	HasHermes     bool        `json:"has_hermes"`
-	Assocs        []PaneAssoc `json:"associations"`
-	Source        string      `json:"source,omitempty"`
-	Running       bool        `json:"running"`
-	Status        string      `json:"status"`
-	SessionID     string      `json:"session_id,omitempty"`
-	Profile       string      `json:"profile,omitempty"`
-	Session       *SessionRow `json:"session,omitempty"`
-	LastQuery     *MsgRow     `json:"last_query,omitempty"`
-	LastAnswer    *MsgRow     `json:"last_answer,omitempty"`
-	ExchangeState string      `json:"exchange_state,omitempty"`
-	Turn          *TurnState  `json:"turn,omitempty"`
-	PaneLines     []string    `json:"pane_content,omitempty"`
+	Pane       Pane        `json:"pane"`
+	HasHermes  bool        `json:"has_hermes"`
+	Assocs     []PaneAssoc `json:"associations"`
+	Source     string      `json:"source,omitempty"`
+	Running    bool        `json:"running"`
+	Status     string      `json:"status"`
+	SessionID  string      `json:"session_id,omitempty"`
+	Profile    string      `json:"profile,omitempty"`
+	Session    *SessionRow `json:"session,omitempty"`
+	LastQuery  *MsgRow     `json:"last_query,omitempty"`
+	LastAnswer *MsgRow     `json:"last_answer,omitempty"`
+	// Steps is how many tool calls the agent has made since the last human
+	// question: the turn's progress as a number, for a console that wants to show
+	// activity without reading the database.
+	Steps         int            `json:"steps_since_query,omitempty"`
+	ExchangeState string         `json:"exchange_state,omitempty"`
+	Turn          *TurnState     `json:"turn,omitempty"`
+	PaneLines     []string       `json:"pane_content,omitempty"`
+	Rhermes       *RhermesStatus `json:"rhermes,omitempty"`
+	RhermesPID    int            `json:"rhermes_pid,omitempty"`
+	RhermesPath   string         `json:"rhermes_socket,omitempty"`
 }
 
 var sessionIDRe = regexp.MustCompile(`\b\d{8}_[0-9]{6}_[0-9a-f]{6,}\b`)
@@ -74,10 +81,14 @@ type Registry struct {
 	turnWindow time.Duration
 	enterDelay time.Duration
 	captureMax int
-	logs       map[string]*logTail  // agent.log path -> tail state, one per profile
-	turnState  map[string]TurnState // session id -> last turn state
-	panes      map[PaneID]PaneStatus
-	updated    time.Time
+	// rhermesAccess selects how a rhermes-backed session is driven: keystrokes
+	// pushes into the pane as before, socket talks to the shim's control socket,
+	// auto uses the socket when the pane has a shim and keystrokes otherwise.
+	rhermesAccess string
+	logs          map[string]*logTail  // agent.log path -> tail state, one per profile
+	turnState     map[string]TurnState // session id -> last turn state
+	panes         map[PaneID]PaneStatus
+	updated       time.Time
 }
 
 // logTail remembers how far one profile's agent.log has been read.
@@ -95,15 +106,16 @@ type TurnState struct {
 }
 
 // NewRegistry builds a Registry.
-func NewRegistry(hermesHome string, dbPath string, turnWindow time.Duration, captureMax int) *Registry {
+func NewRegistry(hermesHome string, dbPath string, turnWindow time.Duration, captureMax int, rhermesAccess string) *Registry {
 	return &Registry{
-		hermesHome: hermesHome,
-		dbPath:     dbPath,
-		turnWindow: turnWindow,
-		captureMax: captureMax,
-		logs:       map[string]*logTail{},
-		turnState:  map[string]TurnState{},
-		panes:      map[PaneID]PaneStatus{},
+		hermesHome:    hermesHome,
+		dbPath:        dbPath,
+		turnWindow:    turnWindow,
+		captureMax:    captureMax,
+		rhermesAccess: rhermesAccess,
+		logs:          map[string]*logTail{},
+		turnState:     map[string]TurnState{},
+		panes:         map[PaneID]PaneStatus{},
 	}
 }
 
@@ -199,6 +211,21 @@ func (r *Registry) scanOnce() {
 	}
 	procs := scanHermesProcs()
 
+	// rhermes shims are matched to panes by controlling terminal, the same way
+	// hermes processes are: the shim sits in the pane (it runs the stock TUI as
+	// its child), so its tty is the pane's tty. A shim on an unknown tty is kept
+	// out of the panes but still followed, so its frames are available through
+	// the API even when tmux knows nothing about it.
+	rhByTty := map[string]RhermesInstance{}
+	for _, inst := range discoverRhermes() {
+		// follow every instance from birth: frames accumulate whether or not
+		// anyone is watching yet, and a drain is then never blind
+		followerFor(inst.Path)
+		if tty := rhermesTty(inst.PID); tty != "" {
+			rhByTty[tty] = inst
+		}
+	}
+
 	// Leases and markers live in each profile's own home, and nowhere else: the
 	// default home's files say nothing about a pane running profile rtassist.
 	profiles := map[string]bool{"": true}
@@ -256,6 +283,26 @@ func (r *Registry) scanOnce() {
 		assocs := ttyProcs[p.TTY]
 		ps.Assocs = assocs
 		ps.Profile = ps.profileOf()
+		if inst, ok := rhByTty[p.TTY]; ok {
+			ps.RhermesPID = inst.PID
+			ps.RhermesPath = inst.Path
+			if st, err := (rhermesClient{path: inst.Path}).status(); err == nil {
+				st.Followed = true
+				ps.Rhermes = &st
+				// the shim's runtime serves the session; the pane has hermes
+				// because the stock TUI runs inside it
+				ps.HasHermes = true
+				ps.Running = true
+				if ps.Status == "" || ps.Status == "no-hermes" {
+					ps.Status = "running"
+				}
+				if ps.SessionID == "" {
+					ps.SessionID = st.ActiveSession
+				}
+			} else {
+				ps.Rhermes = &RhermesStatus{Note: err.Error()}
+			}
+		}
 		for _, a := range assocs {
 			if a.Running {
 				ps.HasHermes = true

@@ -35,8 +35,15 @@ func main() {
 		hermesHome = flag.String("hermes-home", defaultHermesHome(), "hermes home directory ($HERMES_HOME)")
 		dbPath     = flag.String("db", "", "path to hermes state.db (default <hermes-home>/state.db)")
 		captureMax = flag.Int("capture-max", 500, "max lines captured from a pane")
+		rhAccess   = flag.String("rhermes-access", "auto", "how to drive a rhermes-backed session: keystrokes | socket | auto (socket when the pane has a rhermes shim)")
 	)
 	flag.Parse()
+
+	switch *rhAccess {
+	case "keystrokes", "socket", "auto":
+	default:
+		log.Fatalf("rhermes-access %q: must be keystrokes, socket or auto", *rhAccess)
+	}
 
 	switch *mode {
 	case "local", "spagetti":
@@ -48,11 +55,16 @@ func main() {
 		*dbPath = filepath.Join(*hermesHome, "state.db")
 	}
 
-	reg := NewRegistry(*hermesHome, *dbPath, *turnWindow, *captureMax)
+	reg := NewRegistry(*hermesHome, *dbPath, *turnWindow, *captureMax, *rhAccess)
 	enterDelayMs = (*enterDelay).Milliseconds()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// the rhermes followers live on this context too: daemon down, taps closed
+	go func() {
+		<-ctx.Done()
+		close(rhermesStop)
+	}()
 
 	go reg.Run(ctx, *pollEvery)
 

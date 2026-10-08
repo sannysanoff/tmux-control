@@ -40,6 +40,8 @@ All tmux panes with their hermes associations. Fields:
 | `turn` | last observed turn from `agent.log`: `state` (`running`/`answered`/`interrupted`), `since` (log timestamp), `detail` (turn-start query hint or turn-end reason, e.g. `interrupted_by_user`) |
 | `exchange_state` | shortcut of `turn.state` |
 | `pane_content` | current pane text as array of lines (fresh `tmux capture-pane`) |
+| `rhermes_pid`, `rhermes_socket` | set when the pane runs under rhermes: the shim's pid and its control socket `/tmp/rhermes.<pid>` |
+| `rhermes` | the shim's own status: `active_session` (runtime session id), `tui_attached`, `runtime_child`, `tui_pid`, `frames_up`, `frames_down`, `uptime_s`, `followed` |
 
 Sessions with no turn in the recent agent.log window have `turn: null` — the
 status line may still say the pane is running; the two are independent.
@@ -142,15 +144,18 @@ Query parameters (all optional):
 {"session_id":"20261006_200628_6e4365","count":3,"last_id":40350,"has_more":true,
  "events":[
   {"id":40348,"role":"user","content":"please add …","ts":"2026-10-06T18:08:52Z"},
-  {"id":40349,"role":"assistant","tool_calls":"[{\"id\":…","ts":"2026-10-06T18:08:55Z"},
+  {"id":40349,"role":"assistant","tool_calls":"[{\"id\":…","reasoning":"the retry loop is where …","ts":"2026-10-06T18:08:55Z"},
   {"id":40350,"role":"tool","tool_name":"skill_view","content":"{\"success\": true…","ts":"2026-10-06T18:08:55Z"}]}
 ```
 
 `has_more` is true when a full page came back, so a client pages until it is
 short. Store `last_id` and ask for `since_id=<last_id>` next time: a session is
 pulled once and only its new rows travel afterwards. Each row carries `id`,
-`role`, `ts`, and then whichever of `content`, `tool_name`, `tool_calls` apply.
-Clipping appends `…` so a truncated field is never mistaken for the whole text.
+`role`, `ts`, and then whichever of `content`, `tool_name`, `tool_calls`,
+`reasoning` apply. `reasoning` is the agent's own thinking, on assistant rows
+only, clipped by `max_chars` like a tool row — it is by far the largest column in
+the table, and a reader wants its gist rather than its length. Clipping appends
+`…` so a truncated field is never mistaken for the whole text.
 
 The response is gzip-compressed when the request carries
 `Accept-Encoding: gzip`; nothing lower in the stack compresses (the relay carries
@@ -235,6 +240,60 @@ Success:
 missing text, 404 unknown session id, 409 no foreground hermes, 500 tmux
 failure or failed focus check.
 
+## rhermes
+
+A pane that runs under [rhermes](rhermes) — the stock `hermes --tui` with its
+runtime exposed on a unix control socket — is detected during the scan and
+marked on the pane: `rhermes_pid`, `rhermes_socket` (`/tmp/rhermes.<pid>`) and
+`rhermes` (the shim's own status: active runtime session, whether the TUI is
+attached, frame counters, uptime). Such a session can be driven through the
+socket, with no keystrokes pushed into the pane at all.
+
+The flag `-rhermes-access` selects how `/send` and `/paste` behave for such a
+session: `keystrokes` (the pane path as above), `socket` (the text becomes a
+`prompt.submit` through the shim), or `auto` (default: socket when the pane
+has a shim, keystrokes otherwise). A socket-routed answer carries
+`"via":"rhermes"` so a caller can see which way it went.
+
+Direct control, independent of that flag:
+
+### GET /rhermes
+
+Every live shim on this host: `instances` of `pid`, `socket`, and the shim's
+`status` (or `note` when the socket did not answer).
+
+### GET /sessions/{id}/rhermes/status
+
+The shim's status for one session. 404 when the session's pane has no shim.
+
+### GET /sessions/{id}/rhermes/frames?limit=N
+
+The non-blocking pull. The daemon keeps one tap connection per shim (`follow`
+on the ctl socket) and buffers every mirrored frame; this endpoint drains the
+buffer — up to `limit` frames (default: all), oldest first, and the buffer
+empties as it serves. Each frame is `{dir, line, at, clipped}`: `dir` is the
+direction (`up` node→runtime, `down` runtime→node, `inj` an injected frame's
+echo, `ctl` the follow ack), `line` the raw JSON frame, clipped to 8 KB with
+`clipped:true`. `dropped` counts frames evicted from the full ring before this
+drain.
+
+### POST /sessions/{id}/rhermes/prompt
+
+`{"text":"..."}` — inject a user turn through the shim (`prompt.submit`). The
+reply arrives when the runtime accepted the turn (`"status":"streaming"`);
+the answer itself is streamed on the wire, so it shows up in `/frames`.
+Errors: 404 no shim on the pane, 502 the shim refused or timed out.
+
+### POST /sessions/{id}/rhermes/send
+
+`{"method":"...", "params":{...}}` — an arbitrary JSON-RPC call through the
+shim to the runtime, resolved the same way as a prompt.
+
+### POST /sessions/{id}/rhermes/stop
+
+Tear the whole rhermes instance down — TUI, runtime and shim. Destructive; the
+reply only says `{"stopped":true}`.
+
 ## Association logic (for reference)
 
 Panes come from `tmux list-panes -a` keyed by unique pane id. Hermes
@@ -259,3 +318,4 @@ screen-content interpretation anywhere.
 | `-hermes-home` | `~/.hermes` | hermes home (`$HERMES_HOME` respected) |
 | `-db` | `<hermes-home>/state.db` | path to hermes session store |
 | `-capture-max` | `500` | max lines captured per pane |
+| `-rhermes-access` | `auto` | how a rhermes-backed session is driven: `keystrokes`, `socket`, or `auto` (socket when the pane has a shim) |
