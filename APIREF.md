@@ -92,8 +92,13 @@ Single pane status for one hermes session id (same shape as one element of
 Current pane content.
 
 ```json
-{"session_id":"20261005_124256_c6d046","pane_id":"%34","lines":["..."]}
+{"session_id":"20261005_124256_c6d046","pane_id":"%34","lines":["..."],"cursor_x":2,"cursor_y":28}
 ```
+
+`cursor_x`/`cursor_y` carry the pane's cursor position within the viewport
+(`display-message #{cursor_x}|#{cursor_y}`, line index = the viewport line, so
+it indexes `lines` directly). On failure they answer `-1` — a console draws the
+cursor only for valid positions, which keeps a capture-only console unchanged.
 
 Query parameter `color` (optional): `color=1` answers with the capture that
 carries the pane's rendered SGR attributes (`capture-pane -e`) and sets

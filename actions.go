@@ -57,6 +57,26 @@ func captureViewport(id string) ([]string, error) {
 	return lines, nil
 }
 
+// paneCursor reads the pane's cursor position the way focusCheck does. Errors
+// answer (-1, -1): the console treats that as "no cursor known" and draws
+// nothing, so an old tmux or a race with pane death never breaks the poll.
+func paneCursor(id PaneID) (int, int) {
+	dm, err := runTmux("display-message", "-p", "-t", string(id), "#{cursor_y}|#{cursor_x}")
+	if err != nil {
+		return -1, -1
+	}
+	f := strings.Split(strings.TrimSpace(dm), "|")
+	if len(f) != 2 {
+		return -1, -1
+	}
+	cy, _ := strconv.Atoi(f[0])
+	cx, _ := strconv.Atoi(f[1])
+	if cy < 0 || cx < 0 {
+		return -1, -1
+	}
+	return cx, cy
+}
+
 // sendText types text into the pane and optionally presses Enter.
 // Focus check is deterministic geometry: the pane line at cursor_y must
 // contain the hermes input glyph "❯" (the CLI input row).
