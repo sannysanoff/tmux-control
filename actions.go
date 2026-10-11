@@ -10,16 +10,28 @@ import (
 	"unicode/utf8"
 )
 
-// capturePane captures pane text as an array of lines.
-func capturePane(id PaneID, max int) ([]string, error) {
-	out, err := runTmux("capture-pane", "-p", "-t", string(id), "-S", fmt.Sprintf("-%d", max))
+// capturePane captures pane text as an array of lines. With escapes=true the
+// capture carries the pane's rendered SGR attributes (`capture-pane -e`), so a
+// console can paint the screen in color; trailing padding then stays as the
+// terminal drew it (a full-width status bar keeps its background), and the
+// caller strips the codes for any byte-identity work.
+func capturePane(id PaneID, max int, escapes bool) ([]string, error) {
+	args := []string{"capture-pane", "-p"}
+	if escapes {
+		args = append(args, "-e")
+	}
+	args = append(args, "-t", string(id), "-S", fmt.Sprintf("-%d", max))
+	out, err := runTmux(args...)
 	if err != nil {
 		return nil, err
 	}
 	all := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
 	lines := make([]string, 0, len(all))
 	for _, l := range all {
-		lines = append(lines, strings.TrimRight(l, " \t"))
+		if !escapes {
+			l = strings.TrimRight(l, " 	")
+		}
+		lines = append(lines, l)
 	}
 	if len(lines) == 1 && lines[0] == "" {
 		return []string{}, nil

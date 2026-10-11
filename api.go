@@ -172,7 +172,7 @@ func (r *Registry) handleListSessions(w http.ResponseWriter, req *http.Request) 
 	if !noContent {
 		for i := range panes {
 			if panes[i].HasHermes {
-				if lines, err := capturePane(panes[i].Pane.ID, r.captureMax); err == nil {
+				if lines, err := capturePane(panes[i].Pane.ID, r.captureMax, false); err == nil {
 					panes[i].PaneLines = lines
 				}
 			}
@@ -214,7 +214,23 @@ func (r *Registry) handlePane(w http.ResponseWriter, req *http.Request) {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
-	lines, err := capturePane(pid, r.captureMax)
+	// color=1 answers with the capture carrying the pane's SGR attributes
+	// (`capture-pane -e`), so a console can paint the screen in color; any
+	// other value keeps the plain capture byte-exact as before. One capture
+	// per request either way — two captures of a live pane would be a frame
+	// apart. A client that strips the codes back out (ESC + "[...m", then
+	// trim trailing spaces per line) recovers the plain lines exactly; in
+	// color mode trailing padding is kept, because it may carry a background.
+	if req.URL.Query().Get("color") == "1" {
+		clines, err := capturePane(pid, r.captureMax, true)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"session_id": sid, "pane_id": string(pid), "lines": clines, "color": true})
+		return
+	}
+	lines, err := capturePane(pid, r.captureMax, false)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

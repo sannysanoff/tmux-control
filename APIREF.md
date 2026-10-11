@@ -95,6 +95,14 @@ Current pane content.
 {"session_id":"20261005_124256_c6d046","pane_id":"%34","lines":["..."]}
 ```
 
+Query parameter `color` (optional): `color=1` answers with the capture that
+carries the pane's rendered SGR attributes (`capture-pane -e`) and sets
+`"color": true`. Same single capture, codes inserted; codes take no terminal
+columns, so a client that removes them (`ESC [ ... m`) and trims trailing
+spaces per line recovers exactly the plain lines. In color mode trailing
+padding is NOT trimmed — it may carry a background the client should paint.
+Any other value (or omitting it) answers plain, byte-exact as always.
+
 ### GET /sessions/{id}/messages
 
 Recent conversation history for the session, from `state.db`.
