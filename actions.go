@@ -57,24 +57,29 @@ func captureViewport(id string) ([]string, error) {
 	return lines, nil
 }
 
-// paneCursor reads the pane's cursor position the way focusCheck does. Errors
-// answer (-1, -1): the console treats that as "no cursor known" and draws
-// nothing, so an old tmux or a race with pane death never breaks the poll.
-func paneCursor(id PaneID) (int, int) {
-	dm, err := runTmux("display-message", "-p", "-t", string(id), "#{cursor_y}|#{cursor_x}")
+// paneCursor reads the pane's cursor position and pane height the way
+// focusCheck does. Errors answer (-1, -1, -1): the console treats that as "no
+// cursor known" and draws nothing, so an old tmux or a race with pane death
+// never breaks the poll. pane_height rides along because cursor_y is
+// viewport-relative while a capture-pane answer includes history: the console
+// maps cursor_y into the capture as len(lines) - pane_height + cursor_y (the
+// capture's last line is always the viewport's last line).
+func paneCursor(id PaneID) (int, int, int) {
+	dm, err := runTmux("display-message", "-p", "-t", string(id), "#{cursor_y}|#{cursor_x}|#{pane_height}")
 	if err != nil {
-		return -1, -1
+		return -1, -1, -1
 	}
 	f := strings.Split(strings.TrimSpace(dm), "|")
-	if len(f) != 2 {
-		return -1, -1
+	if len(f) != 3 {
+		return -1, -1, -1
 	}
 	cy, _ := strconv.Atoi(f[0])
 	cx, _ := strconv.Atoi(f[1])
-	if cy < 0 || cx < 0 {
-		return -1, -1
+	ph, _ := strconv.Atoi(f[2])
+	if cy < 0 || cx < 0 || ph <= 0 {
+		return -1, -1, -1
 	}
-	return cx, cy
+	return cx, cy, ph
 }
 
 // sendText types text into the pane and optionally presses Enter.

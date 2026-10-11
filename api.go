@@ -221,14 +221,14 @@ func (r *Registry) handlePane(w http.ResponseWriter, req *http.Request) {
 	// line) recovers the plain lines exactly. The cursor position rides with
 	// both answers so the console can draw the block cursor; the capture is
 	// still one per request, the cursor is one cheap display-message.
-	cx, cy := paneCursor(pid)
+	cx, cy, ph := paneCursor(pid)
 	if req.URL.Query().Get("color") == "1" {
 		clines, err := capturePane(pid, r.captureMax, true)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"session_id": sid, "pane_id": string(pid), "lines": clines, "color": true, "cursor_x": cx, "cursor_y": cy})
+		writeJSON(w, http.StatusOK, map[string]any{"session_id": sid, "pane_id": string(pid), "lines": clines, "color": true, "cursor_x": cx, "cursor_y": cy, "pane_height": ph})
 		return
 	}
 	lines, err := capturePane(pid, r.captureMax, false)
@@ -236,7 +236,7 @@ func (r *Registry) handlePane(w http.ResponseWriter, req *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"session_id": sid, "pane_id": string(pid), "lines": lines, "cursor_x": cx, "cursor_y": cy})
+	writeJSON(w, http.StatusOK, map[string]any{"session_id": sid, "pane_id": string(pid), "lines": lines, "cursor_x": cx, "cursor_y": cy, "pane_height": ph})
 }
 
 // handleKeys serves POST /sessions/{id}/keys {text?, keys?}: raw keystrokes
