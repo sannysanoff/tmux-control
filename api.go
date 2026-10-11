@@ -63,6 +63,7 @@ func (r *Registry) Routes() http.Handler {
 	m.HandleFunc("POST /sessions/{id}/break", r.handleBreak)
 	m.HandleFunc("POST /sessions/{id}/send", r.handleSend)
 	m.HandleFunc("POST /sessions/{id}/paste", r.handlePaste)
+	m.HandleFunc("POST /sessions/{id}/keys", r.handleKeys)
 	m.HandleFunc("GET /sessions/{id}/rhermes/status", r.handleRhermesStatus)
 	m.HandleFunc("GET /sessions/{id}/rhermes/frames", r.handleRhermesFrames)
 	m.HandleFunc("POST /sessions/{id}/rhermes/prompt", r.handleRhermesPrompt)
@@ -219,6 +220,42 @@ func (r *Registry) handlePane(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"session_id": sid, "pane_id": string(pid), "lines": lines})
+}
+
+// handleKeys serves POST /sessions/{id}/keys {text?, keys?}: raw keystrokes
+// into the pane, with NO input focus check — a one-key permission dialog is
+// exactly the case /send and /paste refuse. rhermes panes included: this verb
+// deliberately always means terminal keys, never a socket prompt.
+func (r *Registry) handleKeys(w http.ResponseWriter, req *http.Request) {
+	sid := req.PathValue("id")
+	var body struct {
+		Text string   `json:"text"`
+		Keys []string `json:"keys"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	if body.Text == "" && len(body.Keys) == 0 {
+		writeErr(w, http.StatusBadRequest, "text or keys is required")
+		return
+	}
+	pid, ps, err := r.findPaneBySession(sid)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if ps == nil || !ps.Running {
+		writeErr(w, http.StatusConflict, "session is not running in a pane")
+		return
+	}
+	res, err := sendKeys(string(pid), body.Text, body.Keys)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	res["session_id"] = sid
+	writeJSON(w, http.StatusOK, res)
 }
 
 // handleMessages serves GET /sessions/{id}/messages?limit=N&role=R: recent

@@ -280,6 +280,41 @@ Success:
 missing text, 404 unknown session id, 409 no foreground hermes, 500 tmux
 failure or failed focus check.
 
+### POST /sessions/{id}/keys
+
+Deliver raw keystrokes to the pane like a real terminal — the one write verb
+with **no focus check**. Hermes dialogs (permission prompt, "1 allow / 2
+deny") answer to a single keypress while the cursor is NOT on the `❯` input
+row, so `/send` and `/paste` refuse them; `/keys` exists for exactly that.
+It also always means terminal keys: a rhermes-backed pane gets keystrokes
+here too, never a socket prompt.
+
+Request:
+
+```json
+{"keys": ["1"]}
+{"text": "ls -la", "keys": ["Enter"]}
+```
+
+- `keys` (optional) — tmux key names in order (`Enter`, `Escape`, `BSpace`,
+  `Tab`, `C-c`, `Up`, `F5`, `M-x`, …) or single characters. Tokens are
+  validated (letter-led name ≤12 chars, or one character); anything else is
+  400 — the route must never forward option-shaped strings.
+- `text` (optional) — literal text, typed first via `send-keys -l` so it can
+  never be reinterpreted as key names. Max 4096 bytes; max 64 keys.
+- No `enter` and no enter-delay: press `Enter` as its own key when you mean
+  it. At least one of `text`/`keys` is required.
+
+Success:
+
+```json
+{"action":"keys","bytes":7,"keys":1,"ok":true,"pane_id":"%34",
+ "session_id":"20261005_124256_c6d046"}
+```
+
+400 bad token or empty request, 404 unknown session id, 409 pane not running,
+500 tmux failure.
+
 ## rhermes
 
 A pane that runs under [rhermes](rhermes) — the stock `hermes --tui` with its

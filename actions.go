@@ -2,10 +2,12 @@ package main
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // capturePane captures pane text as an array of lines.
@@ -110,6 +112,57 @@ func sendText(id string, text string, enter bool) (map[string]any, error) {
 		"focused":   fi.Focused,
 		"input_row": fi.Y,
 		"cursor":    fmt.Sprintf("%d,%d", fi.X, fi.Y),
+	}, nil
+}
+
+// keyTokenRe accepts tmux key names (Enter, BSpace, C-c, F5, M-x, PPage) and
+// single characters. /keys types raw keystrokes into a pane WITHOUT the input
+// focus check — that is its whole point (a permission dialog is not the "❯"
+// input row) — so it must not forward arbitrary option-shaped strings.
+var keyTokenRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+-]{0,11}$`)
+
+func validKeyToken(tok string) bool {
+	if keyTokenRe.MatchString(tok) {
+		return true
+	}
+	return utf8.RuneCountInString(tok) == 1
+}
+
+// sendKeys delivers raw keystrokes to the pane like a real terminal: literal
+// text (sent first, via send-keys -l so it can never be reinterpreted as key
+// names) followed by named keys in one send-keys call. There is deliberately
+// NO focusCheck here: /send and /paste refuse when the cursor is not on the
+// input row, and a one-key dialog ("1 allow, 2 deny") never is. No enter
+// delay either — the caller presses Enter as its own key when it means it.
+func sendKeys(id string, text string, keys []string) (map[string]any, error) {
+	if len(text) > 4096 {
+		return nil, fmt.Errorf("text too long (%d bytes, max 4096)", len(text))
+	}
+	if len(keys) > 64 {
+		return nil, fmt.Errorf("too many keys (%d, max 64)", len(keys))
+	}
+	for _, k := range keys {
+		if !validKeyToken(k) {
+			return nil, fmt.Errorf("bad key token %q", k)
+		}
+	}
+	if text != "" {
+		if _, err := runTmux("send-keys", "-t", id, "-l", text); err != nil {
+			return nil, err
+		}
+	}
+	if len(keys) > 0 {
+		args := append([]string{"send-keys", "-t", id}, keys...)
+		if _, err := runTmux(args...); err != nil {
+			return nil, err
+		}
+	}
+	return map[string]any{
+		"ok":      true,
+		"action":  "keys",
+		"pane_id": id,
+		"bytes":   len(text),
+		"keys":    len(keys),
 	}, nil
 }
 
