@@ -173,6 +173,46 @@ Success:
 
 409 if the pane has no foreground hermes (`session is not running in a pane`).
 
+### POST /sessions/{id}/fs/stat
+
+Batched existence check over the daemon's filesystem — the box the session's
+tool calls actually ran on. Body:
+
+```json
+{"paths": ["/Users/x/Work/solidus/devops-config", "~/Fun/tmux-web", "/etc/hosts."]}
+```
+
+Answer (order matches the request):
+
+```json
+{"stats":[
+  {"given":"/Users/x/Work/solidus/devops-config","resolved":"/Users/x/Work/solidus/devops-config","type":"dir"},
+  {"given":"~/Fun/tmux-web","resolved":"/Users/x/Fun/tmux-web","type":"dir"},
+  {"given":"/etc/hosts.","err":"no"}]}
+```
+
+`type` is `dir` / `file` / `other`; `file` rows carry `size` and `modified`
+(ISO). A missing path answers `err: "no"`, never an error status — one bad
+candidate must not sink its 199 siblings. Up to 200 paths per call; a bare `/`
+or `~` is `err: "refused"` (listing the filesystem root serves no session).
+404 when the session id is unknown. Read-only: no route here creates, writes,
+deletes or executes anything.
+
+### GET /sessions/{id}/fs/list?path=D
+
+One directory's entries: `{"path":"/resolved/D","count":N,"entries":[{"name":"x","type":"dir"},{"name":"y.go","type":"file","size":4096}]}`.
+Directories first, then alphabetical. Dot files are hidden except
+`.gitignore` and `.env`. 404 when the path does not exist, 400 when it is not a
+directory.
+
+### GET /sessions/{id}/fs/file?path=F&max_bytes=N
+
+A regular file as text: `{"path":F,"text":"…","size":N,"lines":N,"mod":"ISO","binary":false}`.
+Default cap 512 KB (`max_bytes` up to 2 MB); a bigger file is a 413 carrying
+its real size — the caller should read a window instead. A binary file (NUL
+byte in the first 8 KB, the git/grep rule; UTF-16 lands here too) answers
+`{"binary":true,"size":N,"head":"ca fe …"}` — a hex head, never mojibake.
+
 ### POST /sessions/{id}/send
 
 Inject text into the hermes input field via tmux, then press Enter.
