@@ -331,7 +331,15 @@ func (f *follower) run(stop <-chan struct{}) {
 		}
 		err := f.followOnce(stop)
 		f.mu.Lock()
-		f.lastErr = err.Error()
+		// a clean EOF is not an error: bufio's Err() answers nil when the shim
+		// closed the socket, and err.Error() on it is a nil-pointer panic that
+		// takes the whole daemon down (measured). Clear lastErr instead — the
+		// retry below redials in 2s.
+		if err != nil {
+			f.lastErr = err.Error()
+		} else {
+			f.lastErr = ""
+		}
 		f.mu.Unlock()
 		select {
 		case <-stop:
