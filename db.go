@@ -22,6 +22,7 @@ type SessionRow struct {
 
 // MsgRow is one message from the messages table.
 type MsgRow struct {
+	ID        int64  `json:"id"`
 	Role      string `json:"role"`
 	Content   string `json:"content"`
 	Timestamp string `json:"ts"`
@@ -160,6 +161,21 @@ func asString(v any) string {
 }
 
 func asBool(v any) bool { return asString(v) == "1" }
+
+// asInt64 reads a row id that sqlite3 -json hands back as a JSON number (or,
+// on very large ids, a string).
+func asInt64(v any) int64 {
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case string:
+		i, _ := strconv.ParseInt(n, 10, 64)
+		return i
+	case int64:
+		return n
+	}
+	return 0
+}
 
 // asFloat reads a number that sqlite3 -json may hand back as a JSON number.
 func asFloat(v any) float64 {
@@ -821,33 +837,54 @@ func (f roleFilter) rolePredicate() string {
 }
 
 // LoadMessages returns up to limit messages for one session, chronological
-// order (oldest first): selects the newest limit rows by id DESC, then
-// reverses in Go. role selects which rows: "" = user+assistant (default),
-// otherwise exactly one of the accepted roles; other roles (tool/system) are
-// always skipped. role must come from parseRoleFilter, never from raw input.
-func LoadMessages(dbPath, sid string, role roleFilter, limit int) ([]MsgRow, error) {
+// order (oldest first). It reads the WHOLE conversation: with beforeID it
+// pages backwards (rows older than the bound, newest of them first, reversed
+// in Go), with sinceID it pages forwards (rows newer than the cursor, oldest
+// first) — the same incremental crawl /events serves for tool rows. With
+// neither it selects the newest limit rows by id DESC and reverses. role
+// selects which rows: "" = user+assistant (default), otherwise exactly one of
+// the accepted roles; other roles (tool/system) are always skipped. role must
+// come from parseRoleFilter, never from raw input. The row ids ride along:
+// they are the paging cursor and the only tie-proof key (timestamps tie).
+func LoadMessages(dbPath, sid string, role roleFilter, limit int, beforeID, sinceID int64) ([]MsgRow, error) {
 	out := []MsgRow{}
 	lit := idLiteral(sid)
 	if lit == "" {
 		return out, nil
 	}
+	extra := ""
+	forward := false
+	if beforeID > 0 {
+		extra += " AND id < " + strconv.FormatInt(beforeID, 10)
+	}
+	if sinceID > 0 {
+		extra += " AND id > " + strconv.FormatInt(sinceID, 10)
+		forward = true
+	}
+	order := "DESC"
+	if forward {
+		order = "ASC"
+	}
 	q := `SELECT id AS id, role AS role, content AS content,
 	  strftime('%Y-%m-%dT%H:%M:%SZ', timestamp, 'unixepoch') AS ts
-	  FROM messages WHERE ` + role.rolePredicate() + ` AND session_id = ` + lit + `
-	  ORDER BY id DESC LIMIT ` + strconv.Itoa(limit)
+	  FROM messages WHERE ` + role.rolePredicate() + ` AND session_id = ` + lit + extra + `
+	  ORDER BY id ` + order + ` LIMIT ` + strconv.Itoa(limit)
 	rows, err := sqliteJSON(dbPath, q, nil)
 	if err != nil {
 		return nil, err
 	}
 	for _, r := range rows {
 		out = append(out, MsgRow{
+			ID:        asInt64(r["id"]),
 			Role:      asString(r["role"]),
 			Content:   asString(r["content"]),
 			Timestamp: asString(r["ts"]),
 		})
 	}
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
+	if !forward {
+		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+			out[i], out[j] = out[j], out[i]
+		}
 	}
 	return out, nil
 }

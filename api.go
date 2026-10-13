@@ -298,12 +298,33 @@ func (r *Registry) handleMessages(w http.ResponseWriter, req *http.Request) {
 		}
 		limit = n
 	}
+	// before_id pages BACKWARD (rows older than the bound — the reading view
+	// crawls to the session's first prompt), since_id pages FORWARD (cheap
+	// top-ups between polls). Both are exclusive bounds, mirroring /events'
+	// since_id.
+	beforeID, sinceID := int64(0), int64(0)
+	if v := req.URL.Query().Get("before_id"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			writeErr(w, http.StatusBadRequest, "invalid before_id: must be a positive integer")
+			return
+		}
+		beforeID = n
+	}
+	if v := req.URL.Query().Get("since_id"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			writeErr(w, http.StatusBadRequest, "invalid since_id: must be a non-negative integer")
+			return
+		}
+		sinceID = n
+	}
 	role, ok := parseRoleFilter(req.URL.Query().Get("role"))
 	if !ok {
 		writeErr(w, http.StatusBadRequest, "invalid role: must be user, assistant or all")
 		return
 	}
-	msgs, err := LoadMessages(r.dbFor(ps.Profile), sid, role, limit)
+	msgs, err := LoadMessages(r.dbFor(ps.Profile), sid, role, limit, beforeID, sinceID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
