@@ -70,6 +70,8 @@ func (r *Registry) Routes() http.Handler {
 	m.HandleFunc("POST /sessions/{id}/rhermes/send", r.handleRhermesSend)
 	m.HandleFunc("POST /sessions/{id}/rhermes/stop", r.handleRhermesStop)
 	m.HandleFunc("GET /rhermes", r.handleRhermesList)
+	m.HandleFunc("GET /sessions/pane/{pid}/pane", r.handlePaneByID)
+	m.HandleFunc("POST /sessions/pane/{pid}/keys", r.handlePaneByIDKeys)
 	m.HandleFunc("GET /health", r.handleHealth)
 	return m
 }
@@ -237,6 +239,70 @@ func (r *Registry) handlePane(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"session_id": sid, "pane_id": string(pid), "lines": lines, "cursor_x": cx, "cursor_y": cy, "pane_height": ph})
+}
+
+// handlePaneByID serves GET /sessions/pane/{pid}/pane: the live screen of a
+// pane addressed BY PANE ID, for a pane whose hermes has ended — the screen
+// must keep working when the session is gone (the pane is the stable thing).
+// Color rides as on the session route.
+func (r *Registry) handlePaneByID(w http.ResponseWriter, req *http.Request) {
+	pid := PaneID(req.PathValue("pid"))
+	r.mu.RLock()
+	_, ok := r.panes[pid]
+	r.mu.RUnlock()
+	if !ok {
+		writeErr(w, http.StatusNotFound, "no such pane "+string(pid))
+		return
+	}
+	cx, cy, ph := paneCursor(pid)
+	if req.URL.Query().Get("color") == "1" {
+		clines, err := capturePane(pid, r.captureMax, true)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"pane_id": string(pid), "lines": clines, "color": true, "cursor_x": cx, "cursor_y": cy, "pane_height": ph})
+		return
+	}
+	lines, err := capturePane(pid, r.captureMax, false)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"pane_id": string(pid), "lines": lines, "cursor_x": cx, "cursor_y": cy, "pane_height": ph})
+}
+
+// handlePaneByIDKeys serves POST /sessions/pane/{pid}/keys {text?, keys?}: raw
+// keystrokes into a pane addressed by pane id — the fg/exit case exactly. Same
+// body, same validation, same no-focus-check as the session-keyed /keys.
+func (r *Registry) handlePaneByIDKeys(w http.ResponseWriter, req *http.Request) {
+	pid := PaneID(req.PathValue("pid"))
+	r.mu.RLock()
+	_, ok := r.panes[pid]
+	r.mu.RUnlock()
+	if !ok {
+		writeErr(w, http.StatusNotFound, "no such pane "+string(pid))
+		return
+	}
+	var body struct {
+		Text string   `json:"text"`
+		Keys []string `json:"keys"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	if body.Text == "" && len(body.Keys) == 0 {
+		writeErr(w, http.StatusBadRequest, "text or keys is required")
+		return
+	}
+	res, err := sendKeys(string(pid), body.Text, body.Keys)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	res["pane_id"] = string(pid)
+	writeJSON(w, http.StatusOK, res)
 }
 
 // handleKeys serves POST /sessions/{id}/keys {text?, keys?}: raw keystrokes
