@@ -257,15 +257,15 @@ func (r *Registry) handleKeys(w http.ResponseWriter, req *http.Request) {
 		writeErr(w, http.StatusBadRequest, "text or keys is required")
 		return
 	}
-	pid, ps, err := r.findPaneBySession(sid)
+	pid, _, err := r.findPaneBySession(sid)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
-	if ps == nil || !ps.Running {
-		writeErr(w, http.StatusConflict, "session is not running in a pane")
-		return
-	}
+	// No Running check, unlike /send and /paste: the pane lives whether or not
+	// a hermes holds it, and a shell prompt at "hermes just ended" is exactly
+	// when typing `fg` or `exit` into it is the point. Raw keystrokes cannot
+	// disturb a turn that is not there.
 	res, err := sendKeys(string(pid), body.Text, body.Keys)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -596,12 +596,12 @@ func (r *Registry) handleSend(w http.ResponseWriter, req *http.Request) {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
-	if r.useSocket(ps) {
-		r.rhermesPromptThroughSend(w, sid, ps, body.Text)
-		return
-	}
 	if ps == nil || !ps.Running {
 		writeErr(w, http.StatusConflict, "session is not running in a pane")
+		return
+	}
+	if r.useSocket(ps) {
+		r.rhermesPromptThroughSend(w, sid, ps, body.Text)
 		return
 	}
 	res, err := sendText(string(pid), body.Text, enter)
@@ -648,12 +648,12 @@ func (r *Registry) handlePaste(w http.ResponseWriter, req *http.Request) {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
-	if r.useSocket(ps) {
-		r.rhermesPromptThroughSend(w, sid, ps, body.Text)
-		return
-	}
 	if ps == nil || !ps.Running {
 		writeErr(w, http.StatusConflict, "session is not running in a pane")
+		return
+	}
+	if r.useSocket(ps) {
+		r.rhermesPromptThroughSend(w, sid, ps, body.Text)
 		return
 	}
 	res, err := pasteText(string(pid), body.Text, enter)
