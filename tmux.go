@@ -51,10 +51,14 @@ func loadBufferStdin(buf string, content string) error {
 	return nil
 }
 
+// paneFormat is the list-panes format every pane enumeration shares: one line
+// per pane, pipe-separated. The startup dump logs the raw lines in this shape,
+// so a mis-parsed or missing pane is visible in the log next to its source.
+const paneFormat = "#{pane_id}|#{pane_tty}|#{session_name}|#{window_index}|#{window_name}|#{pane_index}|#{pane_current_command}|#{pane_active}|#{pane_dead}"
+
 // listPanes enumerates all panes of the tmux server, deduplicated by pane id.
 func listPanes() (map[PaneID]Pane, error) {
-	out, err := runTmux("list-panes", "-a", "-F",
-		"#{pane_id}|#{pane_tty}|#{session_name}|#{window_index}|#{window_name}|#{pane_index}|#{pane_current_command}|#{pane_active}|#{pane_dead}")
+	out, err := runTmux("list-panes", "-a", "-F", paneFormat)
 	if err != nil {
 		return nil, err
 	}

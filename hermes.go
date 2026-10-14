@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,20 +57,31 @@ type MarkerEntry struct {
 // markerMaxAge bounds how old a marker may be and still be believed.
 const markerMaxAge = 24 * time.Hour
 
-// LoadMarkers reads all ~/.hermes/terminal-sessions/* files.
+// LoadMarkers parses the terminal-sessions directory into tty-keyed markers.
 func LoadMarkers(hermesHome string) (map[string]MarkerEntry, error) {
+	out, _, err := LoadMarkersDetail(hermesHome)
+	return out, err
+}
+
+// LoadMarkersDetail is LoadMarkers plus the skip log: every marker file left
+// out, with the reason (unreadable, unparsable, name not a tty, too old). The
+// startup dump logs these, so a terminal that reads as unattached carries its
+// why in the log.
+func LoadMarkersDetail(hermesHome string) (map[string]MarkerEntry, []string, error) {
 	out := map[string]MarkerEntry{}
+	skipped := []string{}
 	dir := filepath.Join(hermesHome, "terminal-sessions")
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return out, nil
+			return out, skipped, nil
 		}
-		return out, err
+		return out, skipped, err
 	}
 	for _, de := range ents {
 		b, err := os.ReadFile(filepath.Join(dir, de.Name()))
 		if err != nil {
+			skipped = append(skipped, de.Name()+": read: "+err.Error())
 			continue
 		}
 		var m struct {
@@ -78,19 +90,22 @@ func LoadMarkers(hermesHome string) (map[string]MarkerEntry, error) {
 			TS        float64 `json:"ts"`
 		}
 		if json.Unmarshal(b, &m) != nil || m.SessionID == "" {
+			skipped = append(skipped, de.Name()+": unparsable or empty session_id")
 			continue
 		}
 		tty := ttyFromMarkerName(de.Name())
 		if tty == "" {
+			skipped = append(skipped, de.Name()+": name is not a tty path")
 			continue
 		}
 		ts := time.Unix(int64(m.TS), 0)
 		if !ts.IsZero() && time.Since(ts) > markerMaxAge {
+			skipped = append(skipped, fmt.Sprintf("%s: ts %s older than %s", de.Name(), ts.Format(time.RFC3339), markerMaxAge))
 			continue
 		}
 		out[tty] = MarkerEntry{TTY: tty, SessionID: m.SessionID, CWD: m.CWD, TS: ts}
 	}
-	return out, nil
+	return out, skipped, nil
 }
 
 // ttyFromMarkerName turns a marker file name into the device path tmux reports,

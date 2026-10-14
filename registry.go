@@ -119,13 +119,19 @@ func NewRegistry(hermesHome string, dbPath string, turnWindow time.Duration, cap
 	}
 }
 
-// Run polls until ctx is done.
+// Run polls until ctx is done. The first scan is followed by a startup dump:
+// the raw evidence behind that scan lands in the log, so an "unattached" pane
+// can be traced to its source without re-deriving it by hand.
 func (r *Registry) Run(ctx context.Context, every time.Duration) {
-	r.refreshLogState()
+	first := true
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
 		r.scanOnce()
+		if first {
+			first = false
+			r.dumpStartup()
+		}
 		r.refreshLogState()
 		select {
 		case <-ctx.Done():
@@ -133,6 +139,95 @@ func (r *Registry) Run(ctx context.Context, every time.Duration) {
 		case <-t.C:
 		}
 	}
+}
+
+// dumpStartup logs the evidence behind the first scan: which tmux socket and
+// panes the daemon saw, what the proc scan found, which leases and markers
+// hermes left (markers with their skip reasons), which rhermes shims exist, and
+// how the scan joined all of it into pane statuses. A pane that reads as
+// unattached shows here next to the raw line that put it there.
+func (r *Registry) dumpStartup() {
+	// tmux side: the socket the daemon's tmux commands follow
+	if sock := os.Getenv("TMUX"); sock != "" {
+		log.Printf("startup: daemon TMUX=%s (tmux commands follow this socket, not the default)", sock)
+	} else {
+		log.Printf("startup: daemon TMUX empty (tmux commands follow the default server socket)")
+	}
+	if out, err := runTmux("list-sessions", "-F", "#{session_name}|#{session_attached}"); err != nil {
+		log.Printf("startup: tmux list-sessions: %v", err)
+	} else {
+		log.Printf("startup: tmux list-sessions: %s", strings.TrimSpace(out))
+	}
+	raw, err := runTmux("list-panes", "-a", "-F", paneFormat)
+	if err != nil {
+		log.Printf("startup: tmux list-panes: %v", err)
+	} else {
+		lines := []string{}
+		for _, ln := range strings.Split(raw, "\n") {
+			if ln != "" {
+				lines = append(lines, ln)
+			}
+		}
+		log.Printf("startup: tmux list-panes: %d panes", len(lines))
+		for _, ln := range lines {
+			log.Printf("startup: tmux pane: %s", ln)
+		}
+	}
+
+	// proc side: every hermes process, with the tty it sits on
+	procs := scanHermesProcs()
+	log.Printf("startup: hermes procs: %d", len(procs))
+	for _, pr := range procs {
+		log.Printf("startup: hermes proc pid=%d tty=%s suspended=%v profile=%q cmd=%q", pr.pid, pr.tty, pr.suspended, pr.profile, clip(pr.cmdline, 120))
+	}
+
+	// hermes side: leases and markers for every profile the procs name
+	profiles := map[string]bool{"": true}
+	for _, pr := range procs {
+		profiles[pr.profile] = true
+	}
+	for p := range profiles {
+		home := r.profileHome(p)
+		if leases, err := LoadLeases(home); err != nil {
+			log.Printf("startup: leases profile=%q home=%s: %v", p, home, err)
+		} else {
+			for pid, le := range leases {
+				log.Printf("startup: lease profile=%q pid=%d session=%s live=%s", p, pid, le.SessionID, le.LiveSessionID)
+			}
+		}
+		if markers, skipped, err := LoadMarkersDetail(home); err != nil {
+			log.Printf("startup: markers profile=%q home=%s: %v", p, home, err)
+		} else {
+			for tty, m := range markers {
+				log.Printf("startup: marker profile=%q tty=%s session=%s ts=%s", p, tty, m.SessionID, m.TS.Format(time.RFC3339))
+			}
+			for _, s := range skipped {
+				log.Printf("startup: marker skip profile=%q %s", p, s)
+			}
+		}
+	}
+
+	// rhermes shims: a TUI session attaches through one, never through a lease
+	if insts := discoverRhermes(); len(insts) == 0 {
+		log.Printf("startup: rhermes instances: none")
+	} else {
+		for _, inst := range insts {
+			log.Printf("startup: rhermes instance pid=%d socket=%s", inst.PID, inst.Path)
+		}
+	}
+
+	// the join: what the first scan concluded for every pane
+	r.mu.RLock()
+	attached := 0
+	log.Printf("startup: panes after first scan: %d", len(r.panes))
+	for id, ps := range r.panes {
+		if ps.HasHermes {
+			attached++
+		}
+		log.Printf("startup: pane %s tty=%s status=%s source=%s session=%s hermes=%v assocs=%d", id, ps.Pane.TTY, ps.Status, ps.Source, ps.SessionID, ps.HasHermes, len(ps.Assocs))
+	}
+	r.mu.RUnlock()
+	log.Printf("startup: summary: panes=%d hermes-attached=%d", len(r.panes), attached)
 }
 
 // refreshLogState tails every profile's agent.log and updates per-session turn
