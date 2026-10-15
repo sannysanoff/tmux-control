@@ -221,11 +221,16 @@ Directories first, then alphabetical. Dot files are hidden except
 `.gitignore` and `.env`. 404 when the path does not exist, 400 when it is not a
 directory.
 
-### GET /sessions/{id}/fs/file?path=F&max_bytes=N
+### GET /sessions/{id}/fs/file?path=F&max_bytes=N&tail=1
 
 A regular file as text: `{"path":F,"text":"…","size":N,"lines":N,"mod":"ISO","binary":false}`.
 Default cap 512 KB (`max_bytes` up to 2 MB); a bigger file is a 413 carrying
-its real size — the caller should read a window instead. A binary file (NUL
+its real size — the caller should read a window instead. With `tail=1` a
+bigger file is served as its LAST window instead: the final `max_bytes` of the
+file, opening at a line boundary when the window would split one, with
+`"tail":true` and `"offset":N` (the byte the text starts at) added to the
+answer. tail=1 also means a file that grew past the cap mid-watch keeps
+answering — a follower asks tail=1 from the start. A binary file (NUL
 byte in the first 8 KB, the git/grep rule; UTF-16 lands here too) answers
 `{"binary":true,"size":N,"head":"ca fe …"}` — a hex head, never mojibake.
 

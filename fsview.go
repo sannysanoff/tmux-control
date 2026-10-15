@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -167,7 +168,11 @@ func (r *Registry) handleFSList(w http.ResponseWriter, req *http.Request) {
 }
 
 // handleFSFile serves GET /sessions/{id}/fs/file?path=F: a regular file as
-// text, capped, binary named as binary.
+// text, capped, binary named as binary. tail=1 serves the file's LAST window
+// (the same max_bytes cap) instead of refusing an oversized file — a log being
+// written while it is watched grows past any cap from the front, and tail -f
+// reads the end. The response carries tail:true and offset (the byte the text
+// starts at) when tailing, so a caller can tell a window from a whole file.
 func (r *Registry) handleFSFile(w http.ResponseWriter, req *http.Request) {
 	if _, _, err := r.fsSession(req); err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
@@ -187,21 +192,59 @@ func (r *Registry) handleFSFile(w http.ResponseWriter, req *http.Request) {
 		writeErr(w, http.StatusBadRequest, "not a regular file")
 		return
 	}
+	tail := req.URL.Query().Get("tail") == "1"
 	maxBytes := int64(512 * 1024)
 	if req.URL.Query().Has("max_bytes") {
 		if n, err2 := strconv.Atoi(req.URL.Query().Get("max_bytes")); err2 == nil && n > 0 && int64(n) < 2<<20 {
 			maxBytes = int64(n)
 		}
 	}
-	if fi.Size() > maxBytes {
-		writeErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
-			"file is %d bytes; the viewer reads up to %d", fi.Size(), maxBytes))
-		return
-	}
-	data, err := os.ReadFile(p)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
+	var data []byte
+	var offset int64
+	if tail && fi.Size() > maxBytes {
+		// The tail window: open, seek to size-cap, read to EOF. The file may
+		// grow between stat and read — the window then starts a little early,
+		// which is exactly what a follower wants; it never reads past EOF.
+		f, err2 := os.Open(p)
+		if err2 != nil {
+			writeErr(w, http.StatusInternalServerError, err2.Error())
+			return
+		}
+		start := fi.Size() - maxBytes
+		// Start at a line boundary when the window's first byte splits one:
+		// seek back to the newline so the window opens with a whole line.
+		head := make([]byte, 1)
+		if _, err3 := f.ReadAt(head, start); err3 == nil && head[0] != '\n' {
+			var back []byte
+			if start > 512 {
+				back = make([]byte, 512)
+				f.ReadAt(back, start-512)
+				if i := bytes.LastIndexByte(back, '\n'); i >= 0 {
+					start = start - 512 + int64(i) + 1
+				}
+			} else {
+				start = 0
+			}
+		}
+		data = make([]byte, fi.Size()-start)
+		_, err2 = f.ReadAt(data, start)
+		f.Close()
+		if err2 != nil && err2 != io.EOF {
+			writeErr(w, http.StatusInternalServerError, err2.Error())
+			return
+		}
+		offset = start
+	} else {
+		data, err = os.ReadFile(p)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if !tail && fi.Size() > maxBytes {
+			writeErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+				"file is %d bytes; the viewer reads up to %d (or ask with tail=1)", fi.Size(), maxBytes))
+			return
+		}
 	}
 	if fsIsBinary(data) {
 		n := len(data)
@@ -214,14 +257,19 @@ func (r *Registry) handleFSFile(w http.ResponseWriter, req *http.Request) {
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"path":   p,
 		"text":   string(data),
 		"size":   fi.Size(),
 		"binary": false,
 		"lines":  1 + strings.Count(string(data), "\n"),
 		"mod":    fi.ModTime().UTC().Format(time.RFC3339),
-	})
+	}
+	if tail {
+		out["tail"] = true
+		out["offset"] = offset
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // fsIsBinary: a NUL anywhere in the head — the same sniffing rule git and grep
