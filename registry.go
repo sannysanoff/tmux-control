@@ -186,6 +186,33 @@ func (r *Registry) dumpStartup() {
 	for _, pr := range procs {
 		profiles[pr.profile] = true
 	}
+	// The same tty->start map the scan uses, rebuilt here so the dump reports the
+	// markers the scan will actually believe.
+	startedOn := map[string]time.Time{}
+	leasesByPID := map[int]LeaseEntry{}
+	for p := range profiles {
+		if lf, err := LoadLeases(r.profileHome(p)); err == nil {
+			for pid, le := range lf {
+				leasesByPID[pid] = le
+			}
+		}
+	}
+	for _, pr := range procs {
+		if pr.tty == "" {
+			continue
+		}
+		if le, ok := leasesByPID[pr.pid]; ok && le.ProcessStartTime > 0 {
+			startedOn[pr.tty] = time.Unix(int64(le.ProcessStartTime), 0)
+			continue
+		}
+		if st, err := procStartTime(pr.pid); err == nil && st > 0 {
+			startedOn[pr.tty] = time.Unix(int64(st), 0)
+		}
+	}
+	markerOwner := func(tty string) (time.Time, bool) {
+		t, ok := startedOn[tty]
+		return t, ok
+	}
 	for p := range profiles {
 		home := r.profileHome(p)
 		if leases, err := LoadLeases(home); err != nil {
@@ -195,7 +222,7 @@ func (r *Registry) dumpStartup() {
 				log.Printf("startup: lease profile=%q pid=%d session=%s live=%s", p, pid, le.SessionID, le.LiveSessionID)
 			}
 		}
-		if markers, skipped, err := LoadMarkersDetail(home); err != nil {
+		if markers, skipped, err := LoadMarkersDetail(home, markerOwner); err != nil {
 			log.Printf("startup: markers profile=%q home=%s: %v", p, home, err)
 		} else {
 			for tty, m := range markers {
@@ -328,7 +355,6 @@ func (r *Registry) scanOnce() {
 		profiles[pr.profile] = true
 	}
 	leases := map[int]LeaseEntry{}
-	markers := map[string]MarkerEntry{} // "<profile>|<tty>" -> marker
 	for p := range profiles {
 		home := r.profileHome(p)
 		if lf, err := LoadLeases(home); err != nil {
@@ -338,7 +364,34 @@ func (r *Registry) scanOnce() {
 				leases[pid] = le
 			}
 		}
-		if mm, err := LoadMarkers(home); err != nil {
+	}
+
+	// Which hermes started on which tty, so a marker older than the age bound can
+	// still be believed when the process that wrote it is still in the pane. The
+	// lease's process_start_time is the kernel's start stamp and is exact;
+	// procStartTime is the fallback for a process with no lease entry.
+	startedOn := map[string]time.Time{}
+	for _, pr := range procs {
+		if pr.tty == "" {
+			continue
+		}
+		if le, ok := leases[pr.pid]; ok && le.ProcessStartTime > 0 {
+			startedOn[pr.tty] = time.Unix(int64(le.ProcessStartTime), 0)
+			continue
+		}
+		if st, err := procStartTime(pr.pid); err == nil && st > 0 {
+			startedOn[pr.tty] = time.Unix(int64(st), 0)
+		}
+	}
+	markerOwner := func(tty string) (time.Time, bool) {
+		t, ok := startedOn[tty]
+		return t, ok
+	}
+
+	markers := map[string]MarkerEntry{} // "<profile>|<tty>" -> marker
+	for p := range profiles {
+		home := r.profileHome(p)
+		if mm, err := LoadMarkers(home, markerOwner); err != nil {
 			log.Printf("scan: markers %s: %v", home, err)
 		} else {
 			for tty, m := range mm {

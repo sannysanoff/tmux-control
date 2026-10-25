@@ -31,16 +31,37 @@ func TestLoadMarkersDetail(t *testing.T) {
 		return string(b)
 	}
 	write("tty-dev-pts-3", marker("20261014_104731_3064ef", 0))            // loads
-	write("tty-dev-pts-4", marker("20261001_104731_3064ef", 48*time.Hour)) // stale
+	write("tty-dev-pts-4", marker("20261001_104731_3064ef", 48*time.Hour)) // stale, no owner
 	write("tmux_pane--0", marker("20261014_104731_3064ef", 0))             // name not a tty
 	write("tty-dev-pts-5", "not json{")                                    // unparsable
+	write("tty-dev-pts-6", marker("20261022_082437_b37694", 26*time.Hour)) // stale but owned
 
-	markers, skipped, err := LoadMarkersDetail(home)
+	owner := func(tty string) (time.Time, bool) {
+		if tty == "/dev/pts/6" {
+			// the process on this tty started before the marker was written
+			return time.Now().Add(-72 * time.Hour), true
+		}
+		if tty == "/dev/pts/4" {
+			// the tty changed hands: this process is newer than the marker
+			return time.Now().Add(-1 * time.Hour), true
+		}
+		return time.Time{}, false
+	}
+
+	markers, skipped, err := LoadMarkersDetail(home, owner)
 	if err != nil {
 		t.Fatalf("LoadMarkersDetail: %v", err)
 	}
 	if m, ok := markers["/dev/pts/3"]; !ok || m.SessionID != "20261014_104731_3064ef" {
 		t.Fatalf("fresh marker missing: %+v", markers)
+	}
+	// an old marker whose writer still holds the tty is believed
+	if m, ok := markers["/dev/pts/6"]; !ok || m.SessionID != "20261022_082437_b37694" {
+		t.Fatalf("owned stale marker dropped: %+v", markers)
+	}
+	// ...and one whose tty was taken over by a newer process is not
+	if _, ok := markers["/dev/pts/4"]; ok {
+		t.Fatalf("stale marker on a reused tty was believed: %+v", markers)
 	}
 	if len(skipped) != 3 {
 		t.Fatalf("want 3 skips, got %d: %v", len(skipped), skipped)

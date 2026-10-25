@@ -44,9 +44,11 @@ func LoadLeases(hermesHome string) (map[int]LeaseEntry, error) {
 }
 
 // MarkerEntry is one per-tty current-session marker file. The marker names the
-// session that a terminal is currently running, so only a recent one counts: a
-// leftover marker from a session that ended would otherwise label a recycled tty
-// with somebody else's conversation.
+// session that a terminal is currently running, so a stale one must not label a
+// recycled tty with somebody else's conversation. Age alone is not enough to
+// decide that: hermes rewrites the marker only on process start, /new, a
+// compression rotation and CLI close, so a REPL that has been running for days
+// keeps a marker older than any age bound while still owning its tty.
 type MarkerEntry struct {
 	TTY       string
 	SessionID string
@@ -54,12 +56,21 @@ type MarkerEntry struct {
 	TS        time.Time
 }
 
-// markerMaxAge bounds how old a marker may be and still be believed.
+// markerMaxAge bounds how old a marker may be and still be believed on its own.
 const markerMaxAge = 24 * time.Hour
 
+// markerOwnerSlack absorbs the microseconds between a process being created and
+// its marker being written: the lease records the kernel start time and the
+// marker the moment hermes got around to the write.
+const markerOwnerSlack = 5 * time.Minute
+
+// MarkerOwner answers when the hermes process currently occupying a tty was
+// created. The second result is false when nothing is known about that tty.
+type MarkerOwner func(tty string) (time.Time, bool)
+
 // LoadMarkers parses the terminal-sessions directory into tty-keyed markers.
-func LoadMarkers(hermesHome string) (map[string]MarkerEntry, error) {
-	out, _, err := LoadMarkersDetail(hermesHome)
+func LoadMarkers(hermesHome string, owner MarkerOwner) (map[string]MarkerEntry, error) {
+	out, _, err := LoadMarkersDetail(hermesHome, owner)
 	return out, err
 }
 
@@ -67,7 +78,14 @@ func LoadMarkers(hermesHome string) (map[string]MarkerEntry, error) {
 // out, with the reason (unreadable, unparsable, name not a tty, too old). The
 // startup dump logs these, so a terminal that reads as unattached carries its
 // why in the log.
-func LoadMarkersDetail(hermesHome string) (map[string]MarkerEntry, []string, error) {
+//
+// A marker older than markerMaxAge survives when the process on its tty started
+// BEFORE the marker was written: then the writer is still there and the marker
+// describes it, whatever its age. When the process started after the marker, the
+// tty changed hands and the marker names a conversation that is gone — that is
+// the case the age bound exists for. owner may be nil (no process knowledge),
+// and the age bound then applies to every marker.
+func LoadMarkersDetail(hermesHome string, owner MarkerOwner) (map[string]MarkerEntry, []string, error) {
 	out := map[string]MarkerEntry{}
 	skipped := []string{}
 	dir := filepath.Join(hermesHome, "terminal-sessions")
@@ -100,8 +118,22 @@ func LoadMarkersDetail(hermesHome string) (map[string]MarkerEntry, []string, err
 		}
 		ts := time.Unix(int64(m.TS), 0)
 		if !ts.IsZero() && time.Since(ts) > markerMaxAge {
-			skipped = append(skipped, fmt.Sprintf("%s: ts %s older than %s", de.Name(), ts.Format(time.RFC3339), markerMaxAge))
-			continue
+			// The age bound exists for a recycled tty: a marker left by a hermes
+			// that has since exited would otherwise name somebody else's
+			// conversation. If the hermes on this tty started BEFORE the marker
+			// was written, the writer is still in the pane and the marker
+			// describes it — believe it whatever its age.
+			owned := false
+			if owner != nil {
+				if started, ok := owner(tty); ok && started.Before(ts.Add(markerOwnerSlack)) {
+					owned = true
+				}
+			}
+			if !owned {
+				skipped = append(skipped, fmt.Sprintf("%s: ts %s older than %s and no older process holds the tty",
+					de.Name(), ts.Format(time.RFC3339), markerMaxAge))
+				continue
+			}
 		}
 		out[tty] = MarkerEntry{TTY: tty, SessionID: m.SessionID, CWD: m.CWD, TS: ts}
 	}

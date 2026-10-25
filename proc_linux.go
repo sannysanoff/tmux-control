@@ -46,7 +46,12 @@ func scanHermesProcs() []hermesProc {
 	return out
 }
 
-// procStartTime reads /proc/PID/stat field 22 in clock ticks.
+// procStartTime reports when the process started, as a unix timestamp. /proc
+// gives starttime in clock ticks since boot (field 22, i.e. the 20th field after
+// the parenthesised comm), so it is anchored to boot time from /proc/stat. The
+// tick rate is taken as 100 Hz, which is what Linux uses on every architecture
+// this daemon runs on; getting it wrong shifts the answer by a constant factor,
+// which only matters for a marker written within minutes of the process starting.
 func procStartTime(pid int) (float64, error) {
 	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {
@@ -61,11 +66,33 @@ func procStartTime(pid int) (float64, error) {
 	if len(fields) < 20 {
 		return 0, os.ErrInvalid
 	}
-	ticks, err := strconv.ParseFloat(fields[20], 64)
+	ticks, err := strconv.ParseFloat(fields[19], 64)
 	if err != nil {
 		return 0, err
 	}
-	return ticks / 100.0, nil
+	btime, err := bootTime()
+	if err != nil {
+		return 0, err
+	}
+	return btime + ticks/100.0, nil
+}
+
+// bootTime reads the system boot timestamp from /proc/stat's btime line.
+func bootTime() (float64, error) {
+	b, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(line, "btime ") {
+			v, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(line, "btime ")), 64)
+			if err != nil {
+				return 0, err
+			}
+			return v, nil
+		}
+	}
+	return 0, os.ErrNotExist
 }
 
 // procAlive reports whether the pid directory still exists. The start time is
