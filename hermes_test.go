@@ -78,3 +78,29 @@ func TestLoadMarkersDetail(t *testing.T) {
 		}
 	}
 }
+
+// TestHermesProcRe covers the two shapes a hermes command line takes: the
+// installed tree (a path with a trailing slash) and the macOS launcher, whose
+// -c snippet names the tree inside quotes with no slash. The launcher form was
+// the one that read as "hermes procs: 0" on a host where panes clearly ran it.
+func TestHermesProcRe(t *testing.T) {
+	yes := []string{
+		`/Users/san/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main`,
+		`python3 -I -c sys.path.insert(0, '/Users/san/.hermes/hermes-agent'); import hermes_cli`,
+		`python3 -c sys.path.insert(0,"/home/ubuntu/.hermes/hermes-agent")`,
+	}
+	for _, cmd := range yes {
+		if !hermesProcRe.MatchString(cmd) {
+			t.Errorf("not matched as hermes: %s", cmd)
+		}
+	}
+	no := []string{
+		`/usr/bin/vim /Users/san/.hermes/notes`,
+		`/usr/bin/grep hermes-agent /tmp/x`,
+	}
+	for _, cmd := range no {
+		if hermesProcRe.MatchString(cmd) {
+			t.Errorf("matched as hermes: %s", cmd)
+		}
+	}
+}

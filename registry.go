@@ -71,7 +71,10 @@ type PaneStatus struct {
 }
 
 var sessionIDRe = regexp.MustCompile(`\b\d{8}_[0-9]{6}_[0-9a-f]{6,}\b`)
-var hermesProcRe = regexp.MustCompile(`\.hermes/hermes-agent/`)
+// The launcher's -c snippet names the tree as a quoted string with no trailing
+// slash ('/Users/x/.hermes/hermes-agent'), while an installed hermes runs a path
+// inside it (…/hermes-agent/venv/bin/python). Both forms are hermes.
+var hermesProcRe = regexp.MustCompile(`\.hermes/hermes-agent(/|'|"|\s|$)`)
 
 // Registry holds mutable state and scans the system periodically.
 type Registry struct {
