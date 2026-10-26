@@ -60,6 +60,7 @@ func (r *Registry) Routes() http.Handler {
 	m.HandleFunc("POST /sessions/{id}/fs/stat", r.handleFSStat)
 	m.HandleFunc("GET /sessions/{id}/fs/list", r.handleFSList)
 	m.HandleFunc("GET /sessions/{id}/fs/file", r.handleFSFile)
+	m.HandleFunc("GET /sessions/{id}/fs/raw", r.handleFSRaw)
 	m.HandleFunc("POST /sessions/{id}/break", r.handleBreak)
 	m.HandleFunc("POST /sessions/{id}/send", r.handleSend)
 	m.HandleFunc("POST /sessions/{id}/paste", r.handlePaste)

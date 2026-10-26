@@ -282,6 +282,81 @@ func fsIsBinary(data []byte) bool {
 	return bytes.IndexByte(data[:n], 0) >= 0
 }
 
+// fsImageKind names an image by its CONTENT, never by its extension: the
+// console renders these inline, so a file called .jpg that holds a PNG must be
+// painted as the PNG it is, and a .txt that holds neither must not be painted
+// at all. Returns "" for anything else, which is the "not an image" answer.
+func fsImageKind(data []byte) string {
+	switch {
+	case bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")):
+		return "image/png"
+	case bytes.HasPrefix(data, []byte("\xff\xd8\xff")):
+		return "image/jpeg"
+	case bytes.HasPrefix(data, []byte("GIF87a")), bytes.HasPrefix(data, []byte("GIF89a")):
+		return "image/gif"
+	case len(data) > 12 && bytes.HasPrefix(data, []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WEBP")):
+		return "image/webp"
+	}
+	return ""
+}
+
+// fsRawCap is the ceiling for /fs/raw. Screenshots and photos are the target
+// and they run to a few MB; this is a viewer, not a downloader.
+const fsRawCap = 16 << 20
+
+// handleFSRaw serves the file's BYTES with its own content type, for the things
+// a JSON text answer cannot carry: an image the console renders in the viewer.
+// /fs/file is the text route and deliberately refuses binary content (a hex head
+// instead of mojibake inside JSON); this one is the opposite trade — raw bytes,
+// no JSON envelope, and only for a caller that asked for exactly that.
+//
+// Only images are served: the route exists so a jpg/png/gif in a file list can be
+// looked at, and widening it to "any bytes" would turn the console into a file
+// exfiltrator for a session's box. Unknown content is a 415 with the reason.
+func (r *Registry) handleFSRaw(w http.ResponseWriter, req *http.Request) {
+	if _, _, err := r.fsSession(req); err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	p, ok := fsResolvePath(req.URL.Query().Get("path"))
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "path is required")
+		return
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if !fi.Mode().IsRegular() {
+		writeErr(w, http.StatusBadRequest, "not a regular file")
+		return
+	}
+	if fi.Size() > fsRawCap {
+		writeErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+			"file is %d bytes; raw serving stops at %d", fi.Size(), fsRawCap))
+		return
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	kind := fsImageKind(data)
+	if kind == "" {
+		writeErr(w, http.StatusUnsupportedMediaType, "not an image (png, jpeg, gif, webp)")
+		return
+	}
+	// A viewer asks again on every open; the file is local, and a stale image is
+	// indistinguishable from a broken renderer, so no caching.
+	w.Header().Set("Content-Type", kind)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
 // fsSession is the route gate: the path names a session id the daemon knows.
 // The daemon has no per-session file grant to enforce — everything it serves
 // comes from the same box — so the lookup keeps the route in the session
