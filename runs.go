@@ -512,6 +512,21 @@ func (r *Registry) handleDismiss(w http.ResponseWriter, req *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// A resumed run's REPL sits at its prompt long after the work is done, and
+	// that idle pane is the only thing still holding the row in the rail —
+	// dismissing must retire it for good, so the window goes with the file.
+	// Never while a turn is in flight: that would be a kill disguised as an ack.
+	killed := false
+	if pane := bgPaneFor(sid); pane != "" {
+		r.mu.RLock()
+		ts := r.turnState[sid]
+		r.mu.RUnlock()
+		if ts.State != "running" {
+			if _, err := runTmux("kill-window", "-t", pane); err == nil {
+				killed = true
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "session_id": sid, "moved": true, "from": path, "to": dest})
+		"ok": true, "session_id": sid, "moved": true, "from": path, "to": dest, "killed": killed})
 }
