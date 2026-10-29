@@ -129,6 +129,30 @@ func LoadEvents(dbPath, sid string, sinceID int64, limit, maxChars int) ([]Event
 
 // sqliteJSON runs a read-only query via the sqlite3 CLI and returns JSON rows.
 func sqliteJSON(dbPath, query string, args []string) ([]map[string]any, error) {
+	// A WAL database can answer "unable to open database file" while a writer
+	// checkpoint it — a transient that has nothing to do with the query. It is
+	// retried here, at the one choke point every reader goes through, because a
+	// single failed read used to blank a whole rail (state.db is read several
+	// times per poll while hermes writes to it). Anything else fails at once: a
+	// missing db or a bad statement must not be retried into a slow answer.
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 150 * time.Millisecond)
+		}
+		rows, err := sqliteJSONOnce(dbPath, query, args)
+		if err == nil {
+			return rows, nil
+		}
+		lastErr = err
+		if !strings.Contains(err.Error(), "unable to open database file") {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func sqliteJSONOnce(dbPath, query string, args []string) ([]map[string]any, error) {
 	cmdArgs := []string{"-readonly", "-json", dbPath, query}
 	cmdArgs = append(cmdArgs, args...)
 	out, err := exec.Command("sqlite3", cmdArgs...).Output()

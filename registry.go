@@ -70,7 +70,15 @@ type PaneStatus struct {
 	RhermesPath   string         `json:"rhermes_socket,omitempty"`
 }
 
-var sessionIDRe = regexp.MustCompile(`\b\d{8}_[0-9]{6}_[0-9a-f]{6,}\b`)
+// Session ids are hermes' own YYYYMMDD_HHMMSS_hexhex, and the scheduler's
+// cron_<jobid>_<ts> for a scheduled run. The cron form is accepted everywhere
+// a session id is matched (log tail, db lookups) because a cron session is a
+// real session: refusing its id is what kept every autonomous run off the rail.
+// Two shapes: the CLI/gateway one (YYYYMMDD_HHMMSS_hexhex) and the scheduler's
+// cron_<jobid>_YYYYMMDD_HHMMSS, which carries NO trailing hex segment — an
+// optional-prefix regex silently dropped every cron id.
+var sessionIDRe = regexp.MustCompile(`\b(?:cron_[0-9a-f]{6,}_\d{8}_[0-9]{6}|\d{8}_[0-9]{6}_[0-9a-f]{6,})\b`)
+
 // The launcher's -c snippet names the tree as a quoted string with no trailing
 // slash ('/Users/x/.hermes/hermes-agent'), while an installed hermes runs a path
 // inside it (…/hermes-agent/venv/bin/python). Both forms are hermes.

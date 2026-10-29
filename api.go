@@ -50,6 +50,14 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 func (r *Registry) Routes() http.Handler {
 	m := http.NewServeMux()
 	m.HandleFunc("GET /sessions", r.handleListSessions)
+	// Autonomous (cron) runs: sessions no pane displays. /runs lists them,
+	// /sessions/{id}/resume answers one as a background tmux window, and
+	// /sessions/{id}/kill ends that window.
+	m.HandleFunc("GET /runs", r.handleRunList)
+	m.HandleFunc("GET /sessions/{id}/output", r.handleRunOutput)
+	m.HandleFunc("POST /sessions/{id}/resume", r.handleResume)
+	m.HandleFunc("POST /sessions/{id}/kill", r.handleKill)
+	m.HandleFunc("POST /sessions/{id}/dismiss", r.handleDismiss)
 	m.HandleFunc("GET /sessions/{id}", r.handleGetSession)
 	m.HandleFunc("GET /sessions/{id}/pane", r.handlePane)
 	m.HandleFunc("GET /sessions/{id}/messages", r.handleMessages)
@@ -348,9 +356,17 @@ func (r *Registry) handleKeys(w http.ResponseWriter, req *http.Request) {
 // user+assistant behaviour.
 func (r *Registry) handleMessages(w http.ResponseWriter, req *http.Request) {
 	sid := req.PathValue("id")
-	_, ps, err := r.findPaneBySession(sid)
-	if err != nil {
-		writeErr(w, http.StatusNotFound, err.Error())
+	// A pane is the fast path (it names the profile directly), but a session
+	// that no pane displays — every finished cron run — is still readable: its
+	// history is a database view, not a screen.
+	db := ""
+	if _, ps, err := r.findPaneBySession(sid); err == nil {
+		db = r.dbFor(ps.Profile)
+	} else {
+		db = r.dbForSession(sid)
+	}
+	if db == "" {
+		writeErr(w, http.StatusNotFound, "session "+sid+" not associated with any pane")
 		return
 	}
 	limit := 20
@@ -391,7 +407,7 @@ func (r *Registry) handleMessages(w http.ResponseWriter, req *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid role: must be user, assistant or all")
 		return
 	}
-	msgs, err := LoadMessages(r.dbFor(ps.Profile), sid, role, limit, beforeID, sinceID)
+	msgs, err := LoadMessages(db, sid, role, limit, beforeID, sinceID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -405,9 +421,16 @@ func (r *Registry) handleMessages(w http.ResponseWriter, req *http.Request) {
 // start); a full page means there is more, so the caller pages until it is short.
 func (r *Registry) handleEvents(w http.ResponseWriter, req *http.Request) {
 	sid := req.PathValue("id")
-	_, ps, err := r.findPaneBySession(sid)
-	if err != nil {
-		writeErr(w, http.StatusNotFound, err.Error())
+	// Same fallback as /messages: the archive of a finished cron run is a
+	// database view, and a pane-less session must still export.
+	db := ""
+	if _, ps, err := r.findPaneBySession(sid); err == nil {
+		db = r.dbFor(ps.Profile)
+	} else {
+		db = r.dbForSession(sid)
+	}
+	if db == "" {
+		writeErr(w, http.StatusNotFound, "session "+sid+" not associated with any pane")
 		return
 	}
 	q := req.URL.Query()
@@ -448,7 +471,7 @@ func (r *Registry) handleEvents(w http.ResponseWriter, req *http.Request) {
 		maxChars = n
 	}
 
-	events, err := LoadEvents(r.dbFor(ps.Profile), sid, sinceID, limit, maxChars)
+	events, err := LoadEvents(db, sid, sinceID, limit, maxChars)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
