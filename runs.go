@@ -273,7 +273,17 @@ func bgPanes() map[string]string {
 	return out
 }
 
+// hermesBinary finds the launcher. The install tree's own `hermes` comes FIRST:
+// on a box where hermes is not on PATH (a login shell only) the bare name fails,
+// and a PATH hit could belong to a different install than the one whose
+// state.db the daemon reads.
 func hermesBinary() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		tree := filepath.Join(home, ".hermes", "hermes-agent", "hermes")
+		if _, err := os.Stat(tree); err == nil {
+			return tree
+		}
+	}
 	if p, err := exec.LookPath("hermes"); err == nil {
 		return p
 	}
@@ -309,6 +319,8 @@ func (r *Registry) startBackgroundRun(sid, text, home, workdir string) (string, 
 	if _, err := os.Stat(workdir); err != nil {
 		workdir = "/"
 	}
+	// HERMES_HOME is the profile's own home, which is how the CLI selects a
+	// profile: adding -p on top of it would name the profile twice.
 	cmdline := fmt.Sprintf("exec env HERMES_HOME=%s %s chat --resume %s --yolo --query-file %s",
 		shellQuote(home), shellQuote(hermesBinary()), shellQuote(sid), shellQuote(qfile))
 
