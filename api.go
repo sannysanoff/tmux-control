@@ -79,6 +79,7 @@ func (r *Registry) Routes() http.Handler {
 	m.HandleFunc("POST /sessions/{id}/rhermes/send", r.handleRhermesSend)
 	m.HandleFunc("POST /sessions/{id}/rhermes/stop", r.handleRhermesStop)
 	m.HandleFunc("GET /rhermes", r.handleRhermesList)
+	m.HandleFunc("GET /search", r.handleSearch)
 	m.HandleFunc("GET /sessions/pane/{pid}/pane", r.handlePaneByID)
 	m.HandleFunc("POST /sessions/pane/{pid}/keys", r.handlePaneByIDKeys)
 	m.HandleFunc("GET /health", r.handleHealth)
